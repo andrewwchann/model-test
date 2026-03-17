@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ALPR Prototype</string>
+    <string name="home_title">Live ALPR Prototype</string>
+    <string name="home_subtitle">Start a capture session, open the camera, and begin collecting frames for the plate pipeline.</string>
+    <string name="home_card_title">Prototype scope</string>
+    <string name="home_card_body">This first version only opens the camera preview and runs a frame analyzer. Next we can add best-shot selection, quality scoring, plate tracking, and OCR.</string>
+    <string name="start_session">Start Session</string>
+    <string name="live_session">Session Live</string>
+    <string name="live_debug_session">Debug Session Live</string>
+    <string name="session_waiting">Opening camera stream\u2026</string>
+    <string name="session_debug_waiting">Opening camera stream and ALPR debug pipeline\u2026</string>
+    <string name="session_status_title">Session Status</string>
+    <string name="session_status_collapse">Hide</string>
+    <string name="session_status_expand">Show</string>
+    <string name="latest_crop_title">Latest Crop</string>
+    <string name="latest_crop_empty">Waiting for a saved crop</string>
+    <string name="latest_crop_ocr_pending">Crop saved. OCR pending\u2026</string>
+    <string name="latest_crop_ocr_unavailable">Crop saved. OCR unavailable</string>
+    <string name="session_status_format">Frames analyzed: %1$d\nInput frame: %2$d x %3$d</string>
+    <string name="session_guide">Point the rear camera at a plate. This screen is already wired for live frame analysis; plate detection and OCR can be added on top of this pipeline.</string>
+    <string name="session_debug_guide">Overlay colors: yellow = static scene candidate, cyan = filtered plate-like region, green = tracked region accepted for OCR. The top-right card shows the latest saved crop and its OCR text.</string>
+    <string name="close_camera">Close camera</string>
+    <string name="camera_permission_required">Camera permission is required to run a live ALPR session.</string>
+</resources>
