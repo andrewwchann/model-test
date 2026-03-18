@@ -1,16 +1,20 @@
 package com.andre.alprprototype
 
-import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import java.io.File
-import java.nio.FloatBuffer
-import java.util.Locale
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Log
+import java.io.File
+import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class OcrDisplayResult(
     val text: String,
@@ -18,39 +22,50 @@ data class OcrDisplayResult(
 )
 
 class PlateOcrEngine(context: Context) {
-    private val bannedWords = listOf("ALBERTA", "WILDROSE", "COUNTRY")
+    private val tag = "PlateOcrEngine"
     private val env = OrtEnvironment.getEnvironment()
-    private val session = env.createSession(copyAssetToCache(context, "ocr/plate_ocr.onnx").absolutePath, OrtSession.SessionOptions())
-    private val vocab = context.assets.open("ocr/ppocr_keys_v1.txt").bufferedReader().useLines { lines -> lines.toList() }
+    private val config = loadPlateConfig(context, "ocr/plate_config.yaml")
+    private val session = env.createSession(
+        copyAssetToCache(context, "ocr/plate_ocr.onnx").absolutePath,
+        OrtSession.SessionOptions(),
+    )
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val isClosed = AtomicBoolean(false)
+    private val inputName: String
+    private val plateOutputName: String
+
+    init {
+        val validation = validateModelContract()
+        inputName = validation.inputName
+        plateOutputName = validation.plateOutputName
+    }
 
     fun recognize(
         cropPath: String,
         onResult: (OcrDisplayResult?) -> Unit,
     ) {
+        if (isClosed.get()) {
+            onResult(null)
+            return
+        }
         executor.execute {
+            if (isClosed.get()) {
+                onResult(null)
+                return@execute
+            }
             val result = try {
                 val file = File(cropPath)
-                if (!file.exists()) {
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                if (!file.exists() || bitmap == null) {
                     null
                 } else {
-                    val bitmap = BitmapFactory.decodeFile(file.absolutePath)
-                    if (bitmap == null) {
-                        null
-                    } else {
-                        val best = buildVariants(bitmap)
-                            .mapNotNull { variant -> runInference(variant) }
-                            .maxByOrNull { it.score }
-
-                        best?.text?.let {
-                            OcrDisplayResult(
-                                text = it,
-                                sourcePath = file.absolutePath,
-                            )
-                        }
-                    }
+                    buildVariants(bitmap)
+                        .mapNotNull { variant -> runInference(variant, file.absolutePath) }
+                        .maxByOrNull { it.score }
+                        ?.let { OcrDisplayResult(text = it.text, sourcePath = file.absolutePath) }
                 }
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                Log.e(tag, "ocr failed for path=$cropPath", t)
                 null
             }
             onResult(result)
@@ -58,31 +73,67 @@ class PlateOcrEngine(context: Context) {
     }
 
     fun close() {
-        executor.shutdown()
+        if (!isClosed.compareAndSet(false, true)) {
+            return
+        }
+        executor.shutdownNow()
+        executor.awaitTermination(300, TimeUnit.MILLISECONDS)
         session.close()
     }
 
-    private fun runInference(bitmap: Bitmap): ScoredOcrCandidate? {
-        val input = preprocess(bitmap)
-        val shape = longArrayOf(1, 1, 70, 140)
-        val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(input), shape)
-        tensor.use { t ->
-            session.run(mapOf(session.inputNames.first() to t)).use { output ->
-                val logits = extractLogits(output[0].value) ?: return null
-                val decoded = decode(logits)
-                val normalized = normalizePlateText(decoded)
-                if (normalized.isBlank()) {
+    private fun runInference(bitmap: Bitmap, sourcePath: String): ScoredOcrCandidate? {
+        val prepared = preprocess(bitmap)
+        Log.d(
+            tag,
+            "preprocess source=$sourcePath crop=${bitmap.width}x${bitmap.height} resized=${prepared.width}x${prepared.height} " +
+                "tensor=${prepared.shape.joinToString(prefix = "[", postfix = "]")} rgb=NHWC uint8",
+        )
+
+        val tensor = OnnxTensor.createTensor(env, prepared.buffer, prepared.shape, OnnxJavaType.UINT8)
+        tensor.use { inputTensor ->
+            session.run(mapOf(inputName to inputTensor)).use { output ->
+                val plateValue = output.get(plateOutputName).orElse(null)
+                val logits = extractPlateLogits(plateValue?.value) ?: return null
+                val decoded = decodeFixedSlots(logits)
+                logSlotPredictions(decoded)
+                val finalText = normalizePlateText(decoded.rawText)
+                if (finalText.isBlank()) {
+                    Log.d(tag, "decoded blank raw='${decoded.rawText}' final='${decoded.finalText}'")
                     return null
                 }
+                Log.d(tag, "decoded raw='${decoded.rawText}' final='$finalText' avgConf=${format(decoded.averageConfidence)}")
                 return ScoredOcrCandidate(
-                    text = normalized,
-                    score = scorePlateText(normalized),
+                    text = finalText,
+                    score = scoreCandidate(finalText, decoded.averageConfidence),
                 )
             }
         }
     }
 
-    private fun extractLogits(rawValue: Any?): Array<FloatArray>? {
+    private fun preprocess(bitmap: Bitmap): PreparedInput {
+        val targetWidth = config.imgWidth
+        val targetHeight = config.imgHeight
+        val resized = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+        val pixels = IntArray(targetWidth * targetHeight)
+        resized.getPixels(pixels, 0, targetWidth, 0, 0, targetWidth, targetHeight)
+
+        val buffer = ByteBuffer.allocateDirect(targetWidth * targetHeight * 3)
+        for (pixel in pixels) {
+            buffer.put(((pixel shr 16) and 0xFF).toByte())
+            buffer.put(((pixel shr 8) and 0xFF).toByte())
+            buffer.put((pixel and 0xFF).toByte())
+        }
+        buffer.rewind()
+
+        return PreparedInput(
+            buffer = buffer,
+            shape = longArrayOf(1, targetHeight.toLong(), targetWidth.toLong(), 3),
+            width = targetWidth,
+            height = targetHeight,
+        )
+    }
+
+    private fun extractPlateLogits(rawValue: Any?): Array<FloatArray>? {
         return when (rawValue) {
             is Array<*> -> {
                 val first = rawValue.firstOrNull()
@@ -97,96 +148,191 @@ class PlateOcrEngine(context: Context) {
         }
     }
 
-    private fun preprocess(bitmap: Bitmap): FloatArray {
-        val resized = Bitmap.createScaledBitmap(bitmap.toGrayscale(), 140, 70, true)
-        val pixels = IntArray(140 * 70)
-        resized.getPixels(pixels, 0, 140, 0, 0, 140, 70)
-        return FloatArray(140 * 70) { index ->
-            val pixel = pixels[index]
-            val gray = pixel and 0xFF
-            gray / 255f
-        }
-    }
+    private fun decodeFixedSlots(logits: Array<FloatArray>): DecodedPlate {
+        val chars = StringBuilder()
+        val slotPredictions = mutableListOf<SlotPrediction>()
 
-    private fun decode(logits: Array<FloatArray>): String {
-        val sb = StringBuilder()
-        var prevIndex = -1
-        for (step in logits) {
+        for (slotIndex in logits.indices) {
+            val slot = logits[slotIndex]
             var bestIndex = 0
-            var bestScore = Float.NEGATIVE_INFINITY
-            for (i in step.indices) {
-                if (step[i] > bestScore) {
-                    bestScore = step[i]
-                    bestIndex = i
+            var bestValue = Float.NEGATIVE_INFINITY
+            for (classIndex in slot.indices) {
+                if (slot[classIndex] > bestValue) {
+                    bestValue = slot[classIndex]
+                    bestIndex = classIndex
                 }
             }
-            if (bestIndex != 0 && bestIndex != prevIndex) {
-                val charIndex = bestIndex - 1
-                if (charIndex in vocab.indices) {
-                    sb.append(vocab[charIndex])
-                }
-            }
-            prevIndex = bestIndex
+
+            val predictedChar = config.alphabet.getOrNull(bestIndex) ?: config.padChar
+            chars.append(predictedChar)
+            slotPredictions += SlotPrediction(
+                slotIndex = slotIndex,
+                classIndex = bestIndex,
+                character = predictedChar,
+                confidence = bestValue,
+            )
         }
-        return sb.toString()
+
+        val rawText = chars.toString()
+        val trimmed = rawText.trimEnd(config.padChar).trim()
+        val averageConfidence = if (slotPredictions.isEmpty()) 0f else slotPredictions.map { it.confidence }.average().toFloat()
+        return DecodedPlate(
+            rawText = rawText,
+            finalText = trimmed,
+            averageConfidence = averageConfidence,
+            slots = slotPredictions,
+        )
     }
 
     private fun normalizePlateText(raw: String): String {
-        val compact = raw
-            .uppercase(Locale.US)
-            .replace(Regex("[^A-Z0-9]"), "")
+        return raw
+            .trimEnd(config.padChar)
+            .trim()
+    }
 
-        return when {
-            compact.length in 4..8 -> compact
-            compact.length > 8 -> compact.take(8)
-            else -> ""
+    private fun scoreCandidate(text: String, averageConfidence: Float): Float {
+        return averageConfidence + (text.length * 0.05f)
+    }
+
+    private fun logSlotPredictions(decoded: DecodedPlate) {
+        decoded.slots.forEach { slot ->
+            Log.d(
+                tag,
+                "slot=${slot.slotIndex} char='${slot.character}' class=${slot.classIndex} conf=${format(slot.confidence)}",
+            )
         }
+        Log.d(tag, "decoded raw='${decoded.rawText}' stripped='${decoded.finalText}'")
+    }
+
+    private fun validateModelContract(): ModelValidation {
+        val inputEntry = session.inputInfo.entries.firstOrNull()
+            ?: throw IllegalStateException("OCR model has no inputs")
+        val inputTensor = inputEntry.value.info as? TensorInfo
+            ?: throw IllegalStateException("OCR model input is not a tensor")
+        val plateEntry = session.outputInfo["plate"]
+            ?: throw IllegalStateException("OCR model missing 'plate' output")
+        val plateTensor = plateEntry.info as? TensorInfo
+            ?: throw IllegalStateException("OCR model 'plate' output is not a tensor")
+        val regionEntry = session.outputInfo["region"]
+        if (regionEntry == null) {
+            Log.w(tag, "OCR model missing optional 'region' output")
+        }
+
+        val inputShape = inputTensor.shape.map { it.toInt() }
+        val plateShape = plateTensor.shape.map { it.toInt() }
+        val regionShape = (regionEntry?.info as? TensorInfo)?.shape?.map { it.toInt() }
+
+        Log.d(tag, "yaml img=${config.imgWidth}x${config.imgHeight} color=${config.imageColorMode} keepAspect=${config.keepAspectRatio}")
+        Log.d(tag, "yaml alphabetLen=${config.alphabet.length} maxSlots=${config.maxPlateSlots} pad='${config.padChar}'")
+        Log.d(tag, "model input name=${inputEntry.key} shape=$inputShape type=${inputTensor.type}")
+        Log.d(tag, "model output plate shape=$plateShape type=${plateTensor.type}")
+        if (regionShape != null) {
+            Log.d(tag, "model output region shape=$regionShape")
+        }
+
+        if (config.imageColorMode != "rgb") {
+            throw IllegalStateException("Expected rgb color mode, got ${config.imageColorMode}")
+        }
+        if (config.keepAspectRatio) {
+            throw IllegalStateException("Expected keep_aspect_ratio=false for this integration")
+        }
+        if (inputTensor.type != OnnxJavaType.UINT8) {
+            throw IllegalStateException("Expected uint8 input tensor, got ${inputTensor.type}")
+        }
+        if (inputShape.size != 4 || inputShape[1] != config.imgHeight || inputShape[2] != config.imgWidth || inputShape[3] != 3) {
+            throw IllegalStateException("Expected NHWC [batch, ${config.imgHeight}, ${config.imgWidth}, 3], got $inputShape")
+        }
+        if (plateShape.size != 3 || plateShape[1] != config.maxPlateSlots || plateShape[2] != config.alphabet.length) {
+            throw IllegalStateException("Expected plate output [batch, ${config.maxPlateSlots}, ${config.alphabet.length}], got $plateShape")
+        }
+
+        return ModelValidation(
+            inputName = inputEntry.key,
+            plateOutputName = "plate",
+        )
     }
 
     private fun buildVariants(bitmap: Bitmap): List<Bitmap> {
         val crops = bitmap.plateFocusedCrops()
-        return crops.flatMap { crop ->
-            listOf(
-                crop,
-                crop.scaled(2f),
-                crop.focusedBandCrop(0.26f, 0.82f) ?: crop,
-                crop.focusedBandCrop(0.34f, 0.78f) ?: crop,
-            )
-        }.distinctBy { "${it.width}x${it.height}" }
+        val variants = mutableListOf<Bitmap>()
+        crops.firstOrNull()?.let { variants += it }
+        crops.getOrNull(1)?.let { variants += it }
+        crops.getOrNull(2)?.let { variants += it }
+        return variants.distinctBy { "${it.width}x${it.height}" }
     }
 
-    private fun scorePlateText(text: String): Int {
-        if (bannedWords.any { text.contains(it) }) {
-            return -1000
-        }
-        val letterCount = text.count { it in 'A'..'Z' }
-        val digitCount = text.count { it in '0'..'9' }
-        val mixedBonus = if (letterCount > 0 && digitCount > 0) 20 else 0
-        val allLettersPenalty = if (digitCount == 0) 30 else 0
-        return text.length * 10 + minOf(letterCount, 3) * 3 + minOf(digitCount, 4) * 4 + mixedBonus - allLettersPenalty
-    }
+    private fun format(value: Float): String = String.format(java.util.Locale.US, "%.3f", value)
 }
+
+private data class PreparedInput(
+    val buffer: ByteBuffer,
+    val shape: LongArray,
+    val width: Int,
+    val height: Int,
+)
 
 private data class ScoredOcrCandidate(
     val text: String,
-    val score: Int,
+    val score: Float,
 )
 
-private fun Bitmap.scaled(multiplier: Float): Bitmap {
-    val scaledWidth = (width * multiplier).toInt().coerceAtLeast(width)
-    val scaledHeight = (height * multiplier).toInt().coerceAtLeast(height)
-    return Bitmap.createScaledBitmap(this, scaledWidth, scaledHeight, true)
-}
+private data class DecodedPlate(
+    val rawText: String,
+    val finalText: String,
+    val averageConfidence: Float,
+    val slots: List<SlotPrediction>,
+)
 
-private fun Bitmap.toGrayscale(): Bitmap {
-    val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    val canvas = android.graphics.Canvas(output)
-    val matrix = android.graphics.ColorMatrix().apply { setSaturation(0f) }
-    val paint = android.graphics.Paint().apply {
-        colorFilter = android.graphics.ColorMatrixColorFilter(matrix)
+private data class SlotPrediction(
+    val slotIndex: Int,
+    val classIndex: Int,
+    val character: Char,
+    val confidence: Float,
+)
+
+private data class ModelValidation(
+    val inputName: String,
+    val plateOutputName: String,
+)
+
+private data class PlateConfig(
+    val maxPlateSlots: Int,
+    val alphabet: String,
+    val padChar: Char,
+    val imgHeight: Int,
+    val imgWidth: Int,
+    val keepAspectRatio: Boolean,
+    val imageColorMode: String,
+)
+
+private fun loadPlateConfig(context: Context, assetPath: String): PlateConfig {
+    val values = mutableMapOf<String, String>()
+    context.assets.open(assetPath).bufferedReader().useLines { lines ->
+        lines.forEach { rawLine ->
+            val line = rawLine.substringBefore('#').trim()
+            if (line.isBlank() || ':' !in line) {
+                return@forEach
+            }
+            val key = line.substringBefore(':').trim()
+            val value = line.substringAfter(':').trim()
+            values[key] = value
+        }
     }
-    canvas.drawBitmap(this, 0f, 0f, paint)
-    return output
+
+    fun required(key: String): String =
+        values[key] ?: throw IllegalStateException("Missing '$key' in $assetPath")
+
+    val alphabet = required("alphabet").trim('\'', '"')
+    val padChar = required("pad_char").trim('\'', '"').first()
+    return PlateConfig(
+        maxPlateSlots = required("max_plate_slots").toInt(),
+        alphabet = alphabet,
+        padChar = padChar,
+        imgHeight = required("img_height").toInt(),
+        imgWidth = required("img_width").toInt(),
+        keepAspectRatio = required("keep_aspect_ratio").toBooleanStrict(),
+        imageColorMode = required("image_color_mode").trim('\'', '"').lowercase(),
+    )
 }
 
 private fun Bitmap.plateFocusedCrops(): List<Bitmap> {
@@ -212,10 +358,8 @@ private fun Bitmap.focusedBandCrop(
 
 private fun copyAssetToCache(context: Context, assetPath: String): File {
     val outFile = File(context.cacheDir, assetPath.substringAfterLast('/'))
-    if (!outFile.exists()) {
-        context.assets.open(assetPath).use { input ->
-            outFile.outputStream().use { output -> input.copyTo(output) }
-        }
+    context.assets.open(assetPath).use { input ->
+        outFile.outputStream().use { output -> input.copyTo(output) }
     }
     return outFile
 }

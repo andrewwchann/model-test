@@ -197,7 +197,7 @@ class AlprPipeline(
         fun create(context: Context): AlprPipeline {
             val candidateGenerator = YoloTflitePlateCandidateGenerator.createOrNull(context)
                 ?: StaticSceneCandidateGenerator()
-            val scanEveryNFrames = if (candidateGenerator is YoloTflitePlateCandidateGenerator) 1 else 6
+            val scanEveryNFrames = if (candidateGenerator is YoloTflitePlateCandidateGenerator) 2 else 6
             return AlprPipeline(
                 candidateGenerator = candidateGenerator,
                 scanEveryNFrames = scanEveryNFrames,
