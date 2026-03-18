@@ -17,6 +17,7 @@ class BestPlateCropSaver(context: Context) {
     private val outputDir = File(context.filesDir, "alpr-crops").apply { mkdirs() }
     private var bestSavedScore = 0f
     private var savedCount = 0
+    private var lastSavedFrameNumber = Long.MIN_VALUE
 
     fun saveIfBest(image: ImageProxy, state: PipelineDebugState): String? {
         val track = state.activeTrack ?: return null
@@ -24,7 +25,21 @@ class BestPlateCropSaver(context: Context) {
         if (!quality.passes) {
             return null
         }
-        if (quality.totalScore <= bestSavedScore + 0.02f) {
+        val isFirstSave = lastSavedFrameNumber == Long.MIN_VALUE
+        if (isFirstSave && track.ageFrames < MIN_TRACK_AGE_FIRST_SAVE) {
+            return null
+        }
+
+        val cooledDown = state.frameNumber - lastSavedFrameNumber >= REACQUIRE_COOLDOWN_FRAMES
+        if (!isFirstSave && cooledDown && track.ageFrames < MIN_TRACK_AGE_REACQUIRE) {
+            return null
+        }
+        val shouldSave = if (cooledDown) {
+            quality.totalScore >= MIN_REACQUIRE_SCORE
+        } else {
+            quality.totalScore > bestSavedScore + MIN_SCORE_IMPROVEMENT
+        }
+        if (!shouldSave) {
             return null
         }
 
@@ -59,8 +74,17 @@ class BestPlateCropSaver(context: Context) {
 
         bestSavedScore = quality.totalScore
         savedCount += 1
+        lastSavedFrameNumber = state.frameNumber
         pruneOldFiles(keep = 8)
         return file.absolutePath
+    }
+
+    companion object {
+        private const val MIN_SCORE_IMPROVEMENT = 0.02f
+        private const val MIN_REACQUIRE_SCORE = 0.45f
+        private const val REACQUIRE_COOLDOWN_FRAMES = 45L
+        private const val MIN_TRACK_AGE_FIRST_SAVE = 3
+        private const val MIN_TRACK_AGE_REACQUIRE = 2
     }
 
     private fun pruneOldFiles(keep: Int) {

@@ -19,6 +19,8 @@ import com.andre.alprprototype.alpr.YoloTflitePlateCandidateGenerator
 import com.andre.alprprototype.databinding.ActivityCameraBinding
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class CameraActivity : AppCompatActivity() {
     private enum class OcrUiState {
@@ -32,6 +34,8 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var cropSaver: BestPlateCropSaver
     private lateinit var pipeline: AlprPipeline
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var analysisUseCase: ImageAnalysis? = null
     private var latestFrame: AnalyzedFrame? = null
     private var lastSavedCropPath: String? = null
     private var lastOcrRequestedPath: String? = null
@@ -40,6 +44,7 @@ class CameraActivity : AppCompatActivity() {
     private var detectorSelfTestSummary: String = "Self-test: pending"
     private lateinit var plateOcrEngine: PlateOcrEngine
     private var isStatusExpanded: Boolean = false
+    private val isShuttingDown = AtomicBoolean(false)
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -86,46 +91,72 @@ class CameraActivity : AppCompatActivity() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-
-            val preview = Preview.Builder()
-                .build()
-                .also { it.setSurfaceProvider(binding.previewView.surfaceProvider) }
-
-            val analysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(1280, 720))
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-                .also { imageAnalysis ->
-                    imageAnalysis.setAnalyzer(
-                        cameraExecutor,
-                        PlateFrameAnalyzer(pipeline, cropSaver) { frame ->
-                            runOnUiThread {
-                                latestFrame = frame
-                                if (frame.savedCropPath != null) {
-                                    lastSavedCropPath = frame.savedCropPath
-                                    updateCropPreview(frame.savedCropPath)
-                                    requestOcrIfNeeded(frame.savedCropPath)
-                                }
-                                binding.sessionStatus.text = buildStatusText(frame)
-                                binding.debugOverlay.render(frame.state)
-                            }
-                        },
-                    )
+            if (!canUseCamera()) {
+                return@addListener
+            }
+            try {
+                val cameraProvider = cameraProviderFuture.get()
+                if (!canUseCamera()) {
+                    cameraProvider.unbindAll()
+                    return@addListener
                 }
+                this.cameraProvider = cameraProvider
 
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                val preview = Preview.Builder()
+                    .build()
+                    .also { it.setSurfaceProvider(binding.previewView.surfaceProvider) }
 
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(this, cameraSelector, preview, analysis)
+                val analysis = ImageAnalysis.Builder()
+                    .setTargetResolution(Size(1280, 720))
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+                    .also { imageAnalysis ->
+                        analysisUseCase = imageAnalysis
+                        imageAnalysis.setAnalyzer(
+                            cameraExecutor,
+                            PlateFrameAnalyzer(pipeline, cropSaver) { frame ->
+                                runOnUiThread {
+                                    if (!canUpdateUi()) {
+                                        return@runOnUiThread
+                                    }
+                                    latestFrame = frame
+                                    if (frame.savedCropPath != null) {
+                                        lastSavedCropPath = frame.savedCropPath
+                                        updateCropPreview(frame.savedCropPath)
+                                        requestOcrIfNeeded(frame.savedCropPath)
+                                    }
+                                    binding.sessionStatus.text = buildStatusText(frame)
+                                    binding.debugOverlay.render(frame.state)
+                                }
+                            },
+                        )
+                    }
+
+                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+                cameraProvider.unbindAll()
+                if (canUseCamera()) {
+                    cameraProvider.bindToLifecycle(this, cameraSelector, preview, analysis)
+                }
+            } catch (_: Throwable) {
+                // Activity may already be finishing/destroyed when camera provider resolves.
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
     override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
+        isShuttingDown.set(true)
+        analysisUseCase?.clearAnalyzer()
+        cameraProvider?.unbindAll()
+        cameraExecutor.shutdownNow()
+        try {
+            cameraExecutor.awaitTermination(500, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
         pipeline.close()
         plateOcrEngine.close()
+        super.onDestroy()
     }
 
     private fun buildStatusText(frame: AnalyzedFrame): String {
@@ -168,6 +199,9 @@ class CameraActivity : AppCompatActivity() {
             }
 
             runOnUiThread {
+                if (!canUpdateUi()) {
+                    return@runOnUiThread
+                }
                 detectorSelfTestSummary = summary
                 latestFrame?.let { binding.sessionStatus.text = buildStatusText(it) }
                     ?: run {
@@ -187,7 +221,7 @@ class CameraActivity : AppCompatActivity() {
         updateCropCaption()
         plateOcrEngine.recognize(cropPath) { result ->
             runOnUiThread {
-                if (cropPath != lastOcrRequestedPath) {
+                if (!canUpdateUi() || cropPath != lastOcrRequestedPath) {
                     return@runOnUiThread
                 }
                 latestOcrResult = result
@@ -221,5 +255,13 @@ class CameraActivity : AppCompatActivity() {
         binding.sessionStatusToggle.setText(
             if (isStatusExpanded) R.string.session_status_collapse else R.string.session_status_expand,
         )
+    }
+
+    private fun canUpdateUi(): Boolean {
+        return !isShuttingDown.get() && !isDestroyed && !isFinishing
+    }
+
+    private fun canUseCamera(): Boolean {
+        return !isShuttingDown.get() && !isDestroyed && !isFinishing
     }
 }
