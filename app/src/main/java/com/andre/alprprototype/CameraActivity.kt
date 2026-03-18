@@ -17,6 +17,7 @@ import com.andre.alprprototype.alpr.AlprPipeline
 import com.andre.alprprototype.alpr.BestPlateCropSaver
 import com.andre.alprprototype.alpr.YoloTflitePlateCandidateGenerator
 import com.andre.alprprototype.databinding.ActivityCameraBinding
+import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -34,11 +35,13 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var cropSaver: BestPlateCropSaver
     private lateinit var pipeline: AlprPipeline
+    private lateinit var trainingLogUploader: TrainingLogUploader
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
     private var latestFrame: AnalyzedFrame? = null
     private var lastSavedCropPath: String? = null
     private var lastOcrRequestedPath: String? = null
+    private var lastTrainingUploadPath: String? = null
     private var latestOcrResult: OcrDisplayResult? = null
     private var latestOcrState: OcrUiState = OcrUiState.IDLE
     private var detectorSelfTestSummary: String = "Self-test: pending"
@@ -65,6 +68,7 @@ class CameraActivity : AppCompatActivity() {
         cropSaver = BestPlateCropSaver(this)
         pipeline = AlprPipeline.create(this)
         plateOcrEngine = PlateOcrEngine(this)
+        trainingLogUploader = TrainingLogUploader(this)
         binding.sessionStatus.text = "Detector loaded: ${pipeline.detectorName}\n$detectorSelfTestSummary\nOpening camera stream and ALPR debug pipeline..."
         runDetectorSelfTest()
         applyStatusPanelState()
@@ -156,6 +160,7 @@ class CameraActivity : AppCompatActivity() {
         }
         pipeline.close()
         plateOcrEngine.close()
+        trainingLogUploader.close()
         super.onDestroy()
     }
 
@@ -227,6 +232,7 @@ class CameraActivity : AppCompatActivity() {
                 latestOcrResult = result
                 latestOcrState = if (result?.text.isNullOrBlank()) OcrUiState.UNAVAILABLE else OcrUiState.READY
                 updateCropCaption()
+                maybeUploadTrainingSample(cropPath, result)
                 latestFrame?.let { frame ->
                     binding.sessionStatus.text = buildStatusText(frame)
                 }
@@ -248,6 +254,19 @@ class CameraActivity : AppCompatActivity() {
             else -> getString(R.string.latest_crop_empty)
         }
         binding.latestCropCaption.text = ocrText
+    }
+
+    private fun maybeUploadTrainingSample(cropPath: String, result: OcrDisplayResult?) {
+        val uploadResult = result ?: return
+        if (uploadResult.text.isBlank()) {
+            return
+        }
+        val normalizedPath = File(cropPath).absolutePath
+        if (normalizedPath == lastTrainingUploadPath) {
+            return
+        }
+        lastTrainingUploadPath = normalizedPath
+        trainingLogUploader.maybeUpload(normalizedPath, uploadResult)
     }
 
     private fun applyStatusPanelState() {

@@ -3,6 +3,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+fun stringProperty(name: String, defaultValue: String = ""): String {
+    return providers.gradleProperty(name).orElse(defaultValue).get()
+}
+
+fun booleanProperty(name: String, defaultValue: Boolean = false): Boolean {
+    return providers.gradleProperty(name).orElse(defaultValue.toString()).get().toBoolean()
+}
+
 android {
     namespace = "com.andre.alprprototype"
     compileSdk = 34
@@ -15,6 +23,32 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField(
+            "boolean",
+            "TRAINING_LOGGING_ENABLED",
+            booleanProperty("trainingLoggingEnabled", false).toString(),
+        )
+        buildConfigField(
+            "String",
+            "TRAINING_LOGGER_ENDPOINT",
+            "\"${stringProperty("trainingLoggerEndpoint").replace("\"", "\\\"")}\"",
+        )
+        buildConfigField(
+            "String",
+            "TRAINING_LOGGER_SECRET",
+            "\"${stringProperty("trainingLoggerSecret").replace("\"", "\\\"")}\"",
+        )
+        buildConfigField(
+            "boolean",
+            "TRAINING_LOGGER_WIFI_ONLY",
+            booleanProperty("trainingLoggerWifiOnly", false).toString(),
+        )
+        buildConfigField(
+            "double",
+            "TRAINING_LOGGER_MIN_CONFIDENCE",
+            stringProperty("trainingLoggerMinConfidence", "0.0"),
+        )
     }
 
     buildTypes {
@@ -37,6 +71,7 @@ android {
     }
 
     buildFeatures {
+        buildConfig = true
         viewBinding = true
     }
 }
