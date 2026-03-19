@@ -3,6 +3,8 @@ package com.andre.alprprototype
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import org.json.JSONObject
@@ -28,30 +30,39 @@ data class TrainingLogPayload(
     val notes: String? = null,
 )
 
-class TrainingLogUploader(context: Context) {
+class TrainingLogUploader(
+    context: Context,
+    private val onUploadStatus: ((String) -> Unit)? = null,
+) {
     private val appContext = context.applicationContext
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val isClosed = AtomicBoolean(false)
     private val tag = "TrainingLogUploader"
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     fun maybeUpload(cropPath: String, ocrResult: OcrDisplayResult) {
         if (!BuildConfig.TRAINING_LOGGING_ENABLED) {
+            notifyStatus("Training upload disabled")
             return
         }
         if (BuildConfig.TRAINING_LOGGER_ENDPOINT.isBlank()) {
             Log.w(tag, "skipping upload because TRAINING_LOGGER_ENDPOINT is blank")
+            notifyStatus("Upload skipped: endpoint missing")
             return
         }
         if (ocrResult.text.isBlank()) {
+            notifyStatus("Upload skipped: blank OCR")
             return
         }
         val confidence = ocrResult.confidence
         if (confidence != null && confidence < BuildConfig.TRAINING_LOGGER_MIN_CONFIDENCE.toFloat()) {
             Log.d(tag, "skipping upload below confidence threshold path=$cropPath conf=$confidence")
+            notifyStatus("Upload skipped: low confidence")
             return
         }
         if (BuildConfig.TRAINING_LOGGER_WIFI_ONLY && !isOnUnmeteredWifi()) {
             Log.d(tag, "skipping upload because Wi-Fi-only mode is enabled")
+            notifyStatus("Upload skipped: Wi-Fi only")
             return
         }
         if (isClosed.get()) {
@@ -65,6 +76,7 @@ class TrainingLogUploader(context: Context) {
             val file = File(cropPath)
             if (!file.exists() || !file.isFile) {
                 Log.w(tag, "skipping upload because crop file is missing path=$cropPath")
+                notifyStatus("Upload skipped: crop missing")
                 return@execute
             }
 
@@ -81,6 +93,7 @@ class TrainingLogUploader(context: Context) {
                 )
             } catch (t: Throwable) {
                 Log.e(tag, "failed to prepare upload payload path=$cropPath", t)
+                notifyStatus("Upload failed: payload error")
                 return@execute
             }
 
@@ -134,13 +147,27 @@ class TrainingLogUploader(context: Context) {
 
             if (responseCode in 200..299) {
                 Log.i(tag, "upload ok file=${payload.filename} response=$responseText")
+                notifyStatus("Training sample sent")
             } else {
                 Log.w(tag, "upload failed code=$responseCode file=${payload.filename} response=$responseText")
+                notifyStatus("Upload failed: HTTP $responseCode")
             }
         } catch (t: Throwable) {
             Log.e(tag, "upload exception file=${payload.filename}", t)
+            notifyStatus("Upload failed: network error")
         } finally {
             connection?.disconnect()
+        }
+    }
+
+    private fun notifyStatus(message: String) {
+        if (isClosed.get()) {
+            return
+        }
+        mainHandler.post {
+            if (!isClosed.get()) {
+                onUploadStatus?.invoke(message)
+            }
         }
     }
 
