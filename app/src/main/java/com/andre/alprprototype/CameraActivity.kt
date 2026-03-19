@@ -4,6 +4,7 @@ import android.Manifest
 import android.graphics.BitmapFactory
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.Gravity
 import android.util.Size
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -17,12 +18,18 @@ import com.andre.alprprototype.alpr.AlprPipeline
 import com.andre.alprprototype.alpr.BestPlateCropSaver
 import com.andre.alprprototype.alpr.YoloTflitePlateCandidateGenerator
 import com.andre.alprprototype.databinding.ActivityCameraBinding
+import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class CameraActivity : AppCompatActivity() {
+    private data class UploadDecision(
+        val allowed: Boolean,
+        val reason: String,
+    )
+
     private enum class OcrUiState {
         IDLE,
         PENDING,
@@ -34,11 +41,13 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var cropSaver: BestPlateCropSaver
     private lateinit var pipeline: AlprPipeline
+    private lateinit var trainingLogUploader: TrainingLogUploader
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
     private var latestFrame: AnalyzedFrame? = null
     private var lastSavedCropPath: String? = null
     private var lastOcrRequestedPath: String? = null
+    private var lastTrainingUploadPath: String? = null
     private var latestOcrResult: OcrDisplayResult? = null
     private var latestOcrState: OcrUiState = OcrUiState.IDLE
     private var detectorSelfTestSummary: String = "Self-test: pending"
@@ -65,6 +74,11 @@ class CameraActivity : AppCompatActivity() {
         cropSaver = BestPlateCropSaver(this)
         pipeline = AlprPipeline.create(this)
         plateOcrEngine = PlateOcrEngine(this)
+        trainingLogUploader = TrainingLogUploader(this) { message ->
+            if (canUpdateUi()) {
+                showTopToast(message)
+            }
+        }
         binding.sessionStatus.text = "Detector loaded: ${pipeline.detectorName}\n$detectorSelfTestSummary\nOpening camera stream and ALPR debug pipeline..."
         runDetectorSelfTest()
         applyStatusPanelState()
@@ -123,7 +137,7 @@ class CameraActivity : AppCompatActivity() {
                                     if (frame.savedCropPath != null) {
                                         lastSavedCropPath = frame.savedCropPath
                                         updateCropPreview(frame.savedCropPath)
-                                        requestOcrIfNeeded(frame.savedCropPath)
+                                        requestOcrIfNeeded(frame.savedCropPath, frame.state)
                                     }
                                     binding.sessionStatus.text = buildStatusText(frame)
                                     binding.debugOverlay.render(frame.state)
@@ -156,6 +170,7 @@ class CameraActivity : AppCompatActivity() {
         }
         pipeline.close()
         plateOcrEngine.close()
+        trainingLogUploader.close()
         super.onDestroy()
     }
 
@@ -211,7 +226,7 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestOcrIfNeeded(cropPath: String) {
+    private fun requestOcrIfNeeded(cropPath: String, frameState: com.andre.alprprototype.alpr.PipelineDebugState) {
         if (cropPath == lastOcrRequestedPath) {
             return
         }
@@ -227,6 +242,7 @@ class CameraActivity : AppCompatActivity() {
                 latestOcrResult = result
                 latestOcrState = if (result?.text.isNullOrBlank()) OcrUiState.UNAVAILABLE else OcrUiState.READY
                 updateCropCaption()
+                maybeUploadTrainingSample(cropPath, result, frameState)
                 latestFrame?.let { frame ->
                     binding.sessionStatus.text = buildStatusText(frame)
                 }
@@ -250,6 +266,101 @@ class CameraActivity : AppCompatActivity() {
         binding.latestCropCaption.text = ocrText
     }
 
+    private fun maybeUploadTrainingSample(
+        cropPath: String,
+        result: OcrDisplayResult?,
+        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
+    ) {
+        val uploadResult = result ?: return
+        val normalizedPath = File(cropPath).absolutePath
+        val decision = evaluateTrainingUpload(frameState, normalizedPath, uploadResult)
+        logUploadDecision(normalizedPath, uploadResult, frameState, decision)
+        if (!decision.allowed) {
+            showTopToast("Upload skipped: ${decision.reason}")
+            return
+        }
+        lastTrainingUploadPath = normalizedPath
+        trainingLogUploader.maybeUpload(normalizedPath, uploadResult)
+    }
+
+    private fun evaluateTrainingUpload(
+        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
+        cropPath: String,
+        ocrResult: OcrDisplayResult,
+    ): UploadDecision {
+        if (ocrResult.text.isBlank()) {
+            return UploadDecision(false, "blank_ocr")
+        }
+        if (cropPath == lastTrainingUploadPath) {
+            return UploadDecision(false, "duplicate_crop")
+        }
+        val quality = frameState.quality
+        if (quality == null || !quality.passes) {
+            return UploadDecision(false, "quality_reject")
+        }
+        val activeTrack = frameState.activeTrack ?: return UploadDecision(false, "missing_track")
+        if (activeTrack.ageFrames < 3) {
+            return UploadDecision(false, "unstable_track")
+        }
+        val normalizedOcr = normalizePlateTextForUpload(ocrResult.text)
+        if (normalizedOcr.isBlank()) {
+            return UploadDecision(false, "blank_ocr")
+        }
+        val emittedResult = frameState.emittedResult
+        if (emittedResult != null) {
+            if (emittedResult.supportingFrames < 3) {
+                return UploadDecision(false, "insufficient_support")
+            }
+            val normalizedFinal = normalizePlateTextForUpload(emittedResult.text)
+            if (normalizedFinal.isBlank() || normalizedOcr != normalizedFinal) {
+                return UploadDecision(false, "ocr_final_mismatch")
+            }
+        }
+        if (!isPlausiblePlateText(normalizedOcr)) {
+            return UploadDecision(false, "implausible_text")
+        }
+        val confidence = ocrResult.confidence
+        if (confidence != null && confidence < BuildConfig.TRAINING_LOGGER_MIN_CONFIDENCE.toFloat()) {
+            return UploadDecision(false, "low_ocr_confidence")
+        }
+        return UploadDecision(true, "accepted")
+    }
+
+    private fun normalizePlateTextForUpload(text: String): String {
+        return text.uppercase()
+            .filter { it in 'A'..'Z' || it in '0'..'9' }
+    }
+
+    private fun isPlausiblePlateText(text: String): Boolean {
+        if (text.length !in 5..8) {
+            return false
+        }
+        if (text.any { it !in 'A'..'Z' && it !in '0'..'9' }) {
+            return false
+        }
+        if (text.toSet().size == 1) {
+            return false
+        }
+        val dominantCount = text.groupingBy { it }.eachCount().values.maxOrNull() ?: 0
+        return dominantCount < text.length - 1
+    }
+
+    private fun logUploadDecision(
+        cropPath: String,
+        ocrResult: OcrDisplayResult,
+        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
+        decision: UploadDecision,
+    ) {
+        val emitted = frameState.emittedResult
+        val quality = frameState.quality
+        android.util.Log.d(
+            "TrainingUploadGate",
+            "decision=${decision.reason} path=$cropPath ocr='${ocrResult.text}' conf=${ocrResult.confidence} " +
+                "final='${emitted?.text}' votes=${emitted?.supportingFrames} trackAge=${frameState.activeTrack?.ageFrames} " +
+                "quality=${quality?.totalScore}",
+        )
+    }
+
     private fun applyStatusPanelState() {
         binding.sessionStatus.visibility = if (isStatusExpanded) android.view.View.VISIBLE else android.view.View.GONE
         binding.sessionStatusToggle.setText(
@@ -263,5 +374,12 @@ class CameraActivity : AppCompatActivity() {
 
     private fun canUseCamera(): Boolean {
         return !isShuttingDown.get() && !isDestroyed && !isFinishing
+    }
+
+    private fun showTopToast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).apply {
+            setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 120)
+            show()
+        }
     }
 }

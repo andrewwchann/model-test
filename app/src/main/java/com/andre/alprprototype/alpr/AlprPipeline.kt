@@ -124,12 +124,17 @@ class AlprPipeline(
     private val voteWindow = ArrayDeque<OcrCandidate>()
     private var bestCandidate: OcrCandidate? = null
     private var bestQualityScore = 0f
+    private var lastTrackId: Int? = null
 
     fun process(frameNumber: Long, image: ImageProxy): PipelineDebugState {
         val runScan = ((frameNumber - 1L) % scanEveryNFrames.toLong()) == 0L
         val candidates = if (runScan) candidateGenerator.generate(image) else emptyList()
         val detections = if (runScan) candidateFilter.filter(candidates, image) else emptyList()
         val activeTrack = tracker.update(detections)
+        if (activeTrack?.trackId != lastTrackId) {
+            resetRecognitionState()
+            lastTrackId = activeTrack?.trackId
+        }
         val quality = activeTrack?.let { qualityScorer.score(image, it) }
 
         val acceptedCandidate = quality
@@ -191,6 +196,12 @@ class AlprPipeline(
 
     override fun close() {
         candidateGenerator.close()
+    }
+
+    private fun resetRecognitionState() {
+        voteWindow.clear()
+        bestCandidate = null
+        bestQualityScore = 0f
     }
 
     companion object {
@@ -399,8 +410,10 @@ class PlateLikeCandidateFilter : PlateCandidateFilter {
             val centeredness = centeredness(candidate.boundingBox, image.width.toFloat())
 
             if (candidate.source == "yolo-tflite") {
-                val yoloMinWidth = image.width * 0.08f
-                if (width < yoloMinWidth) {
+                val yoloMinWidth = image.width * 0.07f
+                val aspectPass = aspectRatio in 1.4f..8.0f
+                val centeredPass = centeredness >= 0.02f
+                if (width < yoloMinWidth || !aspectPass || !centeredPass) {
                     null
                 } else {
                     PlateDetection(
@@ -439,25 +452,46 @@ class PlateLikeCandidateFilter : PlateCandidateFilter {
 class SimplePlateTracker : PlateTracker {
     private var activeTrack: PlateTrack? = null
     private var nextTrackId = 1
+    private var missedDetections = 0
 
     override fun update(detections: List<PlateDetection>): PlateTrack? {
         val best = detections.maxByOrNull { it.confidence }
         activeTrack = if (best == null) {
-            activeTrack?.copy(ageFrames = nextAge(activeTrack))
+            missedDetections += 1
+            if (missedDetections > MAX_MISSED_DETECTIONS) {
+                null
+            } else {
+                activeTrack
+            }
         } else {
-            val trackId = activeTrack?.trackId ?: nextTrackId++
-            val age = (activeTrack?.ageFrames ?: 0) + 1
-            PlateTrack(
-                trackId = trackId,
-                boundingBox = best.boundingBox,
-                ageFrames = age,
-                source = best.source,
-            )
+            missedDetections = 0
+            val previousTrack = activeTrack
+            val continuesTrack = previousTrack != null &&
+                previousTrack.source == best.source &&
+                overlaps(previousTrack.boundingBox, best.boundingBox) >= IOU_CONTINUITY_THRESHOLD
+            if (continuesTrack) {
+                val continuingTrack = previousTrack!!
+                continuingTrack.copy(
+                    boundingBox = best.boundingBox,
+                    ageFrames = continuingTrack.ageFrames + 1,
+                    source = best.source,
+                )
+            } else {
+                PlateTrack(
+                    trackId = nextTrackId++,
+                    boundingBox = best.boundingBox,
+                    ageFrames = 1,
+                    source = best.source,
+                )
+            }
         }
         return activeTrack
     }
 
-    private fun nextAge(track: PlateTrack?): Int = (track?.ageFrames ?: 0) + 1
+    companion object {
+        private const val IOU_CONTINUITY_THRESHOLD = 0.30f
+        private const val MAX_MISSED_DETECTIONS = 2
+    }
 }
 
 class HeuristicPlateQualityScorer : PlateQualityScorer {

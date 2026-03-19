@@ -80,11 +80,11 @@ class BestPlateCropSaver(context: Context) {
     }
 
     companion object {
-        private const val MIN_SCORE_IMPROVEMENT = 0.02f
-        private const val MIN_REACQUIRE_SCORE = 0.45f
+        private const val MIN_SCORE_IMPROVEMENT = 0.03f
+        private const val MIN_REACQUIRE_SCORE = 0.55f
         private const val REACQUIRE_COOLDOWN_FRAMES = 45L
-        private const val MIN_TRACK_AGE_FIRST_SAVE = 3
-        private const val MIN_TRACK_AGE_REACQUIRE = 2
+        private const val MIN_TRACK_AGE_FIRST_SAVE = 4
+        private const val MIN_TRACK_AGE_REACQUIRE = 3
     }
 
     private fun pruneOldFiles(keep: Int) {

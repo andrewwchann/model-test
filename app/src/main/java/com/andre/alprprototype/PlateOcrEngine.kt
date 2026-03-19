@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 data class OcrDisplayResult(
     val text: String,
     val sourcePath: String,
+    val confidence: Float?,
 )
 
 class PlateOcrEngine(context: Context) {
@@ -62,7 +63,13 @@ class PlateOcrEngine(context: Context) {
                     buildVariants(bitmap)
                         .mapNotNull { variant -> runInference(variant, file.absolutePath) }
                         .maxByOrNull { it.score }
-                        ?.let { OcrDisplayResult(text = it.text, sourcePath = file.absolutePath) }
+                        ?.let {
+                            OcrDisplayResult(
+                                text = it.text,
+                                sourcePath = file.absolutePath,
+                                confidence = it.confidence,
+                            )
+                        }
                 }
             } catch (t: Throwable) {
                 Log.e(tag, "ocr failed for path=$cropPath", t)
@@ -105,6 +112,7 @@ class PlateOcrEngine(context: Context) {
                 return ScoredOcrCandidate(
                     text = finalText,
                     score = scoreCandidate(finalText, decoded.averageConfidence),
+                    confidence = decoded.averageConfidence,
                 )
             }
         }
@@ -274,6 +282,7 @@ private data class PreparedInput(
 private data class ScoredOcrCandidate(
     val text: String,
     val score: Float,
+    val confidence: Float,
 )
 
 private data class DecodedPlate(
