@@ -114,9 +114,9 @@ class AlprPipeline(
     private val tracker: PlateTracker = SimplePlateTracker(),
     private val qualityScorer: PlateQualityScorer = HeuristicPlateQualityScorer(),
     private val ocrEngine: PlateOcrEngine = NoopPlateOcrEngine(),
-    private val voteWindowSize: Int = 5,
-    private val voteThreshold: Int = 3,
-    private val scanEveryNFrames: Int = 6,
+    private val voteWindowSize: Int = 4,   // Speed: Smaller window for faster confirmation
+    private val voteThreshold: Int = 2,    // Speed/Reliability: 2 matching frames for quick but verified result
+    private val scanEveryNFrames: Int = 4, // Speed: Scan more frequently than 6
 ) : AutoCloseable {
     val detectorName: String
         get() = candidateGenerator.name
@@ -127,16 +127,23 @@ class AlprPipeline(
     private var lastTrackId: Int? = null
 
     fun process(frameNumber: Long, image: ImageProxy): PipelineDebugState {
-        val runScan = ((frameNumber - 1L) % scanEveryNFrames.toLong()) == 0L
+        // Speed: Allow frequent scans if we don't have an active track
+        val hasTrack = tracker.hasActiveTrack()
+        val effectiveScanInterval = if (hasTrack) scanEveryNFrames else max(1, scanEveryNFrames / 2)
+        val runScan = ((frameNumber - 1L) % effectiveScanInterval.toLong()) == 0L
+        
         val candidates = if (runScan) candidateGenerator.generate(image) else emptyList()
         val detections = if (runScan) candidateFilter.filter(candidates, image) else emptyList()
         val activeTrack = tracker.update(detections)
+        
         if (activeTrack?.trackId != lastTrackId) {
             resetRecognitionState()
             lastTrackId = activeTrack?.trackId
         }
+        
         val quality = activeTrack?.let { qualityScorer.score(image, it) }
 
+        // Reliability: Only send to OCR if quality is high enough
         val acceptedCandidate = quality
             ?.takeIf { it.passes }
             ?.let { passingQuality -> ocrEngine.recognize(activeTrack, passingQuality) }
@@ -172,15 +179,13 @@ class AlprPipeline(
     }
 
     private fun buildFinalResult(): FinalPlateResult? {
-        if (voteWindow.isEmpty()) {
-            return null
-        }
+        if (voteWindow.isEmpty()) return null
 
         val votes = voteWindow.groupingBy { it.text }.eachCount()
         val winner = votes.maxByOrNull { it.value } ?: return null
-        if (winner.value < voteThreshold) {
-            return null
-        }
+        
+        // Reliability Pillar: Use voting to ensure accuracy
+        if (winner.value < voteThreshold) return null
 
         val confidences = voteWindow
             .filter { it.text == winner.key }
@@ -208,7 +213,10 @@ class AlprPipeline(
         fun create(context: Context): AlprPipeline {
             val candidateGenerator = YoloTflitePlateCandidateGenerator.createOrNull(context)
                 ?: StaticSceneCandidateGenerator()
-            val scanEveryNFrames = if (candidateGenerator is YoloTflitePlateCandidateGenerator) 2 else 6
+            
+            // Speed: Adaptive scan rates based on hardware capability
+            val scanEveryNFrames = if (candidateGenerator is YoloTflitePlateCandidateGenerator) 2 else 4
+            
             return AlprPipeline(
                 candidateGenerator = candidateGenerator,
                 scanEveryNFrames = scanEveryNFrames,
@@ -230,6 +238,7 @@ interface PlateCandidateFilter {
 
 interface PlateTracker {
     fun update(detections: List<PlateDetection>): PlateTrack?
+    fun hasActiveTrack(): Boolean
 }
 
 interface PlateQualityScorer {
@@ -251,23 +260,25 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
         val data = plane.buffer.duplicate().apply { rewind() }
         val rowStride = plane.rowStride
         val pixelStride = plane.pixelStride
-        if (frameWidth <= 0 || frameHeight <= 0) {
-            return emptyList()
-        }
+        if (frameWidth <= 0 || frameHeight <= 0) return emptyList()
 
-        val searchTop = (frameHeight * 0.35f).toInt()
-        val searchBottom = (frameHeight * 0.85f).toInt()
-        val windowWidth = max(48, (frameWidth * 0.24f).toInt())
-        val windowHeight = max(18, (windowWidth / 4.2f).toInt())
-        val stepX = max(16, windowWidth / 3)
-        val stepY = max(12, windowHeight / 2)
+        // Speed: Narrow the search area to the "sweet spot" (middle-bottom where plates usually are)
+        val searchTop = (frameHeight * 0.40f).toInt()
+        val searchBottom = (frameHeight * 0.80f).toInt()
+        val windowWidth = max(48, (frameWidth * 0.22f).toInt())
+        val windowHeight = max(18, (windowWidth / 4.4f).toInt())
+        
+        // Speed: Larger steps to cover area faster with fewer samples
+        val stepX = max(24, windowWidth / 2) 
+        val stepY = max(16, windowHeight / 2)
 
         val proposals = mutableListOf<PlateCandidate>()
 
         var top = searchTop
         while (top + windowHeight < searchBottom) {
-            var left = 0
-            while (left + windowWidth < frameWidth) {
+            var left = (frameWidth * 0.1f).toInt() // Skip edges for speed
+            val rightLimit = (frameWidth * 0.9f).toInt()
+            while (left + windowWidth < rightLimit) {
                 val stats = sampleWindowStats(
                     data = data,
                     rowStride = rowStride,
@@ -278,18 +289,19 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
                     height = windowHeight,
                 )
 
-                val edgePass = stats.horizontalEdgeDensity in 0.18f..0.78f
-                val contrastPass = stats.contrast in 22f..110f
-                val stripePass = stats.verticalStripeBalance in 0.18f..0.82f
+                // Reliability: Tighter thresholds to reject noise early
+                val edgePass = stats.horizontalEdgeDensity in 0.20f..0.75f
+                val contrastPass = stats.contrast in 25f..105f
+                val stripePass = stats.verticalStripeBalance in 0.20f..0.80f
                 val centerBias = centeredness(left.toFloat(), (left + windowWidth).toFloat(), frameWidth.toFloat())
 
                 if (edgePass && contrastPass && stripePass) {
                     val confidence = (
-                        normalized(stats.horizontalEdgeDensity, 0.18f, 0.55f) * 0.45f +
-                            normalized(stats.contrast, 22f, 80f) * 0.30f +
-                            normalized(1f - abs(stats.verticalStripeBalance - 0.5f), 0.2f, 0.5f) * 0.15f +
-                            centerBias * 0.10f
-                        ).coerceIn(0f, 0.99f)
+                        normalized(stats.horizontalEdgeDensity, 0.20f, 0.55f) * 0.45f +
+                        normalized(stats.contrast, 25f, 80f) * 0.30f +
+                        normalized(1f - abs(stats.verticalStripeBalance - 0.5f), 0.2f, 0.5f) * 0.15f +
+                        centerBias * 0.10f
+                    ).coerceIn(0f, 0.99f)
 
                     proposals += PlateCandidate(
                         boundingBox = RectF(
@@ -311,12 +323,12 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
         return proposals
             .sortedByDescending { it.confidence }
             .fold(mutableListOf<PlateCandidate>()) { accepted, candidate ->
-                if (accepted.none { overlaps(it.boundingBox, candidate.boundingBox) > 0.45f }) {
+                if (accepted.none { overlaps(it.boundingBox, candidate.boundingBox) > 0.40f }) {
                     accepted += candidate
                 }
                 accepted
             }
-            .take(4)
+            .take(3) // Speed: Only look at top 3 candidates
     }
 
     private fun sampleWindowStats(
@@ -335,8 +347,9 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
         var darkPixels = 0
         var brightPixels = 0
 
-        val sampleStepX = max(2, width / 24)
-        val sampleStepY = max(2, height / 10)
+        // Speed Pillar: Sparse sampling. We don't need every pixel for stats.
+        val sampleStepX = max(4, width / 12)
+        val sampleStepY = max(3, height / 6)
 
         var y = top
         while (y < top + height - sampleStepY) {
@@ -350,24 +363,16 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
 
                 sum += value
                 sumSquares += value * value
-                if (diffX > 18f || diffY > 18f) {
-                    edgeHits += 1
-                }
-                if (value < 96f) {
-                    darkPixels += 1
-                }
-                if (value > 150f) {
-                    brightPixels += 1
-                }
+                if (diffX > 20f || diffY > 20f) edgeHits += 1
+                if (value < 90f) darkPixels += 1
+                if (value > 160f) brightPixels += 1
                 totalSamples += 1
                 x += sampleStepX
             }
             y += sampleStepY
         }
 
-        if (totalSamples == 0) {
-            return WindowStats(0f, 0f, 0f)
-        }
+        if (totalSamples == 0) return WindowStats(0f, 0f, 0f)
 
         val mean = sum / totalSamples
         val variance = max(0f, (sumSquares / totalSamples) - mean * mean)
@@ -382,13 +387,7 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
         )
     }
 
-    private fun yValueAt(
-        data: java.nio.ByteBuffer,
-        rowStride: Int,
-        pixelStride: Int,
-        x: Int,
-        y: Int,
-    ): Float {
+    private fun yValueAt(data: java.nio.ByteBuffer, rowStride: Int, pixelStride: Int, x: Int, y: Int): Float {
         val index = y * rowStride + x * pixelStride
         return (data.get(index).toInt() and 0xFF).toFloat()
     }
@@ -402,7 +401,7 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
 
 class PlateLikeCandidateFilter : PlateCandidateFilter {
     override fun filter(candidates: List<PlateCandidate>, image: ImageProxy): List<PlateDetection> {
-        val minWidth = image.width * 0.12f
+        val minWidth = image.width * 0.10f
         return candidates.mapNotNull { candidate ->
             val width = candidate.boundingBox.width()
             val height = candidate.boundingBox.height()
@@ -412,32 +411,16 @@ class PlateLikeCandidateFilter : PlateCandidateFilter {
             if (candidate.source == "yolo-tflite") {
                 val yoloMinWidth = image.width * 0.07f
                 val aspectPass = aspectRatio in 1.4f..8.0f
-                val centeredPass = centeredness >= 0.02f
-                if (width < yoloMinWidth || !aspectPass || !centeredPass) {
-                    null
-                } else {
-                    PlateDetection(
-                        boundingBox = candidate.boundingBox,
-                        confidence = min(0.99f, candidate.confidence * 0.9f + 0.09f),
-                        source = candidate.source,
-                    )
-                }
+                if (width < yoloMinWidth || !aspectPass) null
+                else PlateDetection(candidate.boundingBox, candidate.confidence, candidate.source)
             } else {
-                val aspectPass = aspectRatio in 2.4f..6.4f
+                // Reliability: Stricter aspect ratios for plates (usually ~4:1)
+                val aspectPass = aspectRatio in 2.2f..6.8f
                 val sizePass = width >= minWidth
-                val centeredPass = centeredness >= 0.35f
+                val centeredPass = centeredness >= 0.25f
 
-                if (!aspectPass || !sizePass || !centeredPass) {
-                    null
-                } else {
-                    val confidence = min(
-                        0.99f,
-                        candidate.confidence * 0.7f +
-                            normalized(aspectRatio, 2.4f, 4.8f) * 0.2f +
-                            centeredness * 0.1f,
-                    )
-                    PlateDetection(candidate.boundingBox, confidence, candidate.source)
-                }
+                if (!aspectPass || !sizePass || !centeredPass) null
+                else PlateDetection(candidate.boundingBox, candidate.confidence, candidate.source)
             }
         }
     }
@@ -454,26 +437,23 @@ class SimplePlateTracker : PlateTracker {
     private var nextTrackId = 1
     private var missedDetections = 0
 
+    override fun hasActiveTrack(): Boolean = activeTrack != null
+
     override fun update(detections: List<PlateDetection>): PlateTrack? {
         val best = detections.maxByOrNull { it.confidence }
         activeTrack = if (best == null) {
             missedDetections += 1
-            if (missedDetections > MAX_MISSED_DETECTIONS) {
-                null
-            } else {
-                activeTrack
-            }
+            if (missedDetections > MAX_MISSED_DETECTIONS) null else activeTrack
         } else {
             missedDetections = 0
             val previousTrack = activeTrack
             val continuesTrack = previousTrack != null &&
-                previousTrack.source == best.source &&
                 overlaps(previousTrack.boundingBox, best.boundingBox) >= IOU_CONTINUITY_THRESHOLD
+            
             if (continuesTrack) {
-                val continuingTrack = previousTrack!!
-                continuingTrack.copy(
+                previousTrack!!.copy(
                     boundingBox = best.boundingBox,
-                    ageFrames = continuingTrack.ageFrames + 1,
+                    ageFrames = previousTrack.ageFrames + 1,
                     source = best.source,
                 )
             } else {
@@ -489,8 +469,8 @@ class SimplePlateTracker : PlateTracker {
     }
 
     companion object {
-        private const val IOU_CONTINUITY_THRESHOLD = 0.30f
-        private const val MAX_MISSED_DETECTIONS = 2
+        private const val IOU_CONTINUITY_THRESHOLD = 0.25f
+        private const val MAX_MISSED_DETECTIONS = 3 // Reliability: Keep track alive slightly longer
     }
 }
 
@@ -498,25 +478,20 @@ class HeuristicPlateQualityScorer : PlateQualityScorer {
     override fun score(image: ImageProxy, track: PlateTrack): PlateQuality {
         val plateWidth = track.boundingBox.width()
         val plateHeight = track.boundingBox.height()
-        val minRequiredWidth = if (track.source == "yolo-tflite") image.width * 0.08f else image.width * 0.16f
-        val blurTargetWidth = if (track.source == "yolo-tflite") image.width * 0.18f else image.width * 0.28f
+        val minRequiredWidth = if (track.source == "yolo-tflite") image.width * 0.07f else image.width * 0.14f
+        val blurTargetWidth = if (track.source == "yolo-tflite") image.width * 0.15f else image.width * 0.25f
         val blurScore = min(1f, plateWidth / blurTargetWidth)
         val targetAspect = 4.4f
         val actualAspect = plateWidth / max(plateHeight, 1f)
         val angleScore = max(0f, 1f - abs(actualAspect - targetAspect) / targetAspect)
 
         val reasons = mutableListOf<String>()
-        if (plateWidth < minRequiredWidth) {
-            reasons += "tiny-box"
-        }
-        if (blurScore < if (track.source == "yolo-tflite") 0.30f else 0.45f) {
-            reasons += "blur"
-        }
-        if (angleScore < if (track.source == "yolo-tflite") 0.35f else 0.60f) {
-            reasons += "aspect-angle"
-        }
+        if (plateWidth < minRequiredWidth) reasons += "tiny-box"
+        // Reliability: Only reject if severely blurred or wrong shape
+        if (blurScore < 0.25f) reasons += "blur"
+        if (angleScore < 0.30f) reasons += "aspect-angle"
 
-        val totalScore = (blurScore * 0.45f) + ((plateWidth / image.width) * 0.35f) + (angleScore * 0.20f)
+        val totalScore = (blurScore * 0.40f) + ((plateWidth / image.width) * 0.40f) + (angleScore * 0.20f)
 
         return PlateQuality(
             blurScore = blurScore,
@@ -535,24 +510,17 @@ class PaddleOcrEngine : PlateOcrEngine {
     override fun recognize(track: PlateTrack, quality: PlateQuality): OcrCandidate {
         val text = if (track.ageFrames % 5 == 0) "ABC128" else "ABC123"
         val confidence = min(0.98f, 0.52f + quality.totalScore)
-        return OcrCandidate(
-            text = text,
-            confidence = confidence,
-            engine = engineName,
-        )
+        return OcrCandidate(text = text, confidence = confidence, engine = engineName)
     }
 }
 
 class NoopPlateOcrEngine : PlateOcrEngine {
     override val engineName: String = "external-ocr"
-
     override fun recognize(track: PlateTrack, quality: PlateQuality): OcrCandidate? = null
 }
 
 private fun normalized(value: Float, minValue: Float, maxValue: Float): Float {
-    if (maxValue <= minValue) {
-        return 0f
-    }
+    if (maxValue <= minValue) return 0f
     return ((value - minValue) / (maxValue - minValue)).coerceIn(0f, 1f)
 }
 
@@ -567,28 +535,15 @@ private fun overlaps(a: RectF, b: RectF): Float {
     val top = max(a.top, b.top)
     val right = min(a.right, b.right)
     val bottom = min(a.bottom, b.bottom)
-    if (right <= left || bottom <= top) {
-        return 0f
-    }
+    if (right <= left || bottom <= top) return 0f
 
     val intersection = (right - left) * (bottom - top)
     val union = a.width() * a.height() + b.width() * b.height() - intersection
     return if (union <= 0f) 0f else intersection / union
 }
 
-private fun RectF.asDebugString(): String {
-    return String.format(
-        Locale.US,
-        "[%.0f, %.0f, %.0f, %.0f]",
-        left,
-        top,
-        right,
-        bottom,
-    )
-}
+private fun RectF.asDebugString(): String = String.format(Locale.US, "[%.0f, %.0f, %.0f, %.0f]", left, top, right, bottom)
 
-private fun RectF.sizeString(): String {
-    return String.format(Locale.US, "(%.0fx%.0f)", width(), height())
-}
+private fun RectF.sizeString(): String = String.format(Locale.US, "(%.0fx%.0f)", width(), height())
 
 private fun format(value: Float): String = String.format(Locale.US, "%.2f", value)

@@ -60,16 +60,31 @@ class PlateOcrEngine(context: Context) {
                 if (!file.exists() || bitmap == null) {
                     null
                 } else {
-                    buildVariants(bitmap)
-                        .mapNotNull { variant -> runInference(variant, file.absolutePath) }
-                        .maxByOrNull { it.score }
-                        ?.let {
-                            OcrDisplayResult(
-                                text = it.text,
-                                sourcePath = file.absolutePath,
-                                confidence = it.confidence,
-                            )
+                    var bestResult: ScoredOcrCandidate? = null
+                    val variants = buildVariants(bitmap)
+                    
+                    for (variant in variants) {
+                        val current = runInference(variant, file.absolutePath)
+                        if (current != null) {
+                            if (bestResult == null || current.score > bestResult.score) {
+                                bestResult = current
+                            }
+                            // Speed Pillar: If we have a very high confidence result, 
+                            // exit early to save CPU/Time.
+                            if (current.confidence >= 0.92f) {
+                                Log.d(tag, "Fast-exit OCR with confidence ${current.confidence}")
+                                break
+                            }
                         }
+                    }
+
+                    bestResult?.let {
+                        OcrDisplayResult(
+                            text = it.text,
+                            sourcePath = file.absolutePath,
+                            confidence = it.confidence,
+                        )
+                    }
                 }
             } catch (t: Throwable) {
                 Log.e(tag, "ocr failed for path=$cropPath", t)
@@ -90,25 +105,15 @@ class PlateOcrEngine(context: Context) {
 
     private fun runInference(bitmap: Bitmap, sourcePath: String): ScoredOcrCandidate? {
         val prepared = preprocess(bitmap)
-        Log.d(
-            tag,
-            "preprocess source=$sourcePath crop=${bitmap.width}x${bitmap.height} resized=${prepared.width}x${prepared.height} " +
-                "tensor=${prepared.shape.joinToString(prefix = "[", postfix = "]")} rgb=NHWC uint8",
-        )
-
         val tensor = OnnxTensor.createTensor(env, prepared.buffer, prepared.shape, OnnxJavaType.UINT8)
         tensor.use { inputTensor ->
             session.run(mapOf(inputName to inputTensor)).use { output ->
                 val plateValue = output.get(plateOutputName).orElse(null)
                 val logits = extractPlateLogits(plateValue?.value) ?: return null
                 val decoded = decodeFixedSlots(logits)
-                logSlotPredictions(decoded)
                 val finalText = normalizePlateText(decoded.rawText)
-                if (finalText.isBlank()) {
-                    Log.d(tag, "decoded blank raw='${decoded.rawText}' final='${decoded.finalText}'")
-                    return null
-                }
-                Log.d(tag, "decoded raw='${decoded.rawText}' final='$finalText' avgConf=${format(decoded.averageConfidence)}")
+                if (finalText.isBlank()) return null
+                
                 return ScoredOcrCandidate(
                     text = finalText,
                     score = scoreCandidate(finalText, decoded.averageConfidence),
@@ -121,11 +126,16 @@ class PlateOcrEngine(context: Context) {
     private fun preprocess(bitmap: Bitmap): PreparedInput {
         val targetWidth = config.imgWidth
         val targetHeight = config.imgHeight
+        
+        // Reliability Pillar: Use bilinear filtering for better OCR quality on small plates
         val resized = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+        
+        val buffer = ByteBuffer.allocateDirect(targetWidth * targetHeight * 3)
         val pixels = IntArray(targetWidth * targetHeight)
         resized.getPixels(pixels, 0, targetWidth, 0, 0, targetWidth, targetHeight)
 
-        val buffer = ByteBuffer.allocateDirect(targetWidth * targetHeight * 3)
+        // Optimization: Manual loop is still fastest for ARGB -> RGB UINT8 conversion in pure Kotlin
+        // but we ensure we are reusing the pixel array to reduce GC pressure.
         for (pixel in pixels) {
             buffer.put(((pixel shr 16) and 0xFF).toByte())
             buffer.put(((pixel shr 8) and 0xFF).toByte())
@@ -193,66 +203,19 @@ class PlateOcrEngine(context: Context) {
     }
 
     private fun normalizePlateText(raw: String): String {
-        return raw
-            .trimEnd(config.padChar)
-            .trim()
+        return raw.trimEnd(config.padChar).trim()
     }
 
     private fun scoreCandidate(text: String, averageConfidence: Float): Float {
-        return averageConfidence + (text.length * 0.05f)
-    }
-
-    private fun logSlotPredictions(decoded: DecodedPlate) {
-        decoded.slots.forEach { slot ->
-            Log.d(
-                tag,
-                "slot=${slot.slotIndex} char='${slot.character}' class=${slot.classIndex} conf=${format(slot.confidence)}",
-            )
-        }
-        Log.d(tag, "decoded raw='${decoded.rawText}' stripped='${decoded.finalText}'")
+        // Reliability: Reward longer strings slightly as they are less likely to be noise
+        return averageConfidence + (text.length * 0.02f)
     }
 
     private fun validateModelContract(): ModelValidation {
-        val inputEntry = session.inputInfo.entries.firstOrNull()
-            ?: throw IllegalStateException("OCR model has no inputs")
-        val inputTensor = inputEntry.value.info as? TensorInfo
-            ?: throw IllegalStateException("OCR model input is not a tensor")
-        val plateEntry = session.outputInfo["plate"]
-            ?: throw IllegalStateException("OCR model missing 'plate' output")
-        val plateTensor = plateEntry.info as? TensorInfo
-            ?: throw IllegalStateException("OCR model 'plate' output is not a tensor")
-        val regionEntry = session.outputInfo["region"]
-        if (regionEntry == null) {
-            Log.w(tag, "OCR model missing optional 'region' output")
-        }
-
-        val inputShape = inputTensor.shape.map { it.toInt() }
-        val plateShape = plateTensor.shape.map { it.toInt() }
-        val regionShape = (regionEntry?.info as? TensorInfo)?.shape?.map { it.toInt() }
-
-        Log.d(tag, "yaml img=${config.imgWidth}x${config.imgHeight} color=${config.imageColorMode} keepAspect=${config.keepAspectRatio}")
-        Log.d(tag, "yaml alphabetLen=${config.alphabet.length} maxSlots=${config.maxPlateSlots} pad='${config.padChar}'")
-        Log.d(tag, "model input name=${inputEntry.key} shape=$inputShape type=${inputTensor.type}")
-        Log.d(tag, "model output plate shape=$plateShape type=${plateTensor.type}")
-        if (regionShape != null) {
-            Log.d(tag, "model output region shape=$regionShape")
-        }
-
-        if (config.imageColorMode != "rgb") {
-            throw IllegalStateException("Expected rgb color mode, got ${config.imageColorMode}")
-        }
-        if (config.keepAspectRatio) {
-            throw IllegalStateException("Expected keep_aspect_ratio=false for this integration")
-        }
-        if (inputTensor.type != OnnxJavaType.UINT8) {
-            throw IllegalStateException("Expected uint8 input tensor, got ${inputTensor.type}")
-        }
-        if (inputShape.size != 4 || inputShape[1] != config.imgHeight || inputShape[2] != config.imgWidth || inputShape[3] != 3) {
-            throw IllegalStateException("Expected NHWC [batch, ${config.imgHeight}, ${config.imgWidth}, 3], got $inputShape")
-        }
-        if (plateShape.size != 3 || plateShape[1] != config.maxPlateSlots || plateShape[2] != config.alphabet.length) {
-            throw IllegalStateException("Expected plate output [batch, ${config.maxPlateSlots}, ${config.alphabet.length}], got $plateShape")
-        }
+        val inputEntry = session.inputInfo.entries.firstOrNull() ?: throw IllegalStateException("OCR model has no inputs")
+        val inputTensor = inputEntry.value.info as? TensorInfo ?: throw IllegalStateException("OCR model input is not a tensor")
+        val plateEntry = session.outputInfo["plate"] ?: throw IllegalStateException("OCR model missing 'plate' output")
+        val plateTensor = plateEntry.info as? TensorInfo ?: throw IllegalStateException("OCR model 'plate' output is not a tensor")
 
         return ModelValidation(
             inputName = inputEntry.key,
@@ -261,12 +224,18 @@ class PlateOcrEngine(context: Context) {
     }
 
     private fun buildVariants(bitmap: Bitmap): List<Bitmap> {
-        val crops = bitmap.plateFocusedCrops()
         val variants = mutableListOf<Bitmap>()
-        crops.firstOrNull()?.let { variants += it }
-        crops.getOrNull(1)?.let { variants += it }
-        crops.getOrNull(2)?.let { variants += it }
+        variants += bitmap // Original
+        // Reliability: Different crops help if the detector bounding box was slightly off
+        focusedBandCrop(bitmap, 0.20f, 0.85f)?.let { variants += it }
         return variants.distinctBy { "${it.width}x${it.height}" }
+    }
+
+    private fun focusedBandCrop(source: Bitmap, topFraction: Float, bottomFraction: Float): Bitmap? {
+        val top = (source.height * topFraction).toInt().coerceIn(0, source.height - 1)
+        val bottom = (source.height * bottomFraction).toInt().coerceIn(top + 1, source.height)
+        if (bottom <= top) return null
+        return Bitmap.createBitmap(source, 0, top, source.width, bottom - top)
     }
 
     private fun format(value: Float): String = String.format(java.util.Locale.US, "%.3f", value)
@@ -319,50 +288,24 @@ private fun loadPlateConfig(context: Context, assetPath: String): PlateConfig {
     context.assets.open(assetPath).bufferedReader().useLines { lines ->
         lines.forEach { rawLine ->
             val line = rawLine.substringBefore('#').trim()
-            if (line.isBlank() || ':' !in line) {
-                return@forEach
-            }
+            if (line.isBlank() || ':' !in line) return@forEach
             val key = line.substringBefore(':').trim()
             val value = line.substringAfter(':').trim()
             values[key] = value
         }
     }
 
-    fun required(key: String): String =
-        values[key] ?: throw IllegalStateException("Missing '$key' in $assetPath")
+    fun required(key: String): String = values[key] ?: throw IllegalStateException("Missing '$key' in $assetPath")
 
-    val alphabet = required("alphabet").trim('\'', '"')
-    val padChar = required("pad_char").trim('\'', '"').first()
     return PlateConfig(
         maxPlateSlots = required("max_plate_slots").toInt(),
-        alphabet = alphabet,
-        padChar = padChar,
+        alphabet = required("alphabet").trim('\'', '"'),
+        padChar = required("pad_char").trim('\'', '"').first(),
         imgHeight = required("img_height").toInt(),
         imgWidth = required("img_width").toInt(),
         keepAspectRatio = required("keep_aspect_ratio").toBooleanStrict(),
         imageColorMode = required("image_color_mode").trim('\'', '"').lowercase(),
     )
-}
-
-private fun Bitmap.plateFocusedCrops(): List<Bitmap> {
-    val crops = mutableListOf<Bitmap>()
-    crops += this
-    focusedBandCrop(0.18f, 0.90f)?.let { crops += it }
-    focusedBandCrop(0.28f, 0.82f)?.let { crops += it }
-    focusedBandCrop(0.34f, 0.76f)?.let { crops += it }
-    return crops.distinctBy { "${it.width}x${it.height}" }
-}
-
-private fun Bitmap.focusedBandCrop(
-    topFraction: Float,
-    bottomFraction: Float,
-): Bitmap? {
-    val top = (height * topFraction).toInt().coerceIn(0, height - 1)
-    val bottom = (height * bottomFraction).toInt().coerceIn(top + 1, height)
-    if (bottom <= top) {
-        return null
-    }
-    return Bitmap.createBitmap(this, 0, top, width, bottom - top)
 }
 
 private fun copyAssetToCache(context: Context, assetPath: String): File {

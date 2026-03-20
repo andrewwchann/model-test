@@ -44,6 +44,16 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
+    <Button
+        android:id="@+id/syncButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:text="Sync Registry"
+        app:layout_constraintBottom_toBottomOf="@id/sessionLabel"
+        app:layout_constraintStart_toEndOf="@id/sessionLabel"
+        app:layout_constraintTop_toTopOf="@id/sessionLabel" />
+
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/cropPreviewCard"
         android:layout_width="140dp"
@@ -71,18 +81,31 @@
                 android:textSize="12sp"
                 android:textStyle="bold" />
 
-            <ImageView
-                android:id="@+id/latestCropImage"
+            <FrameLayout
                 android:layout_width="match_parent"
                 android:layout_height="76dp"
-                android:layout_marginTop="8dp"
-                android:adjustViewBounds="true"
-                android:background="@drawable/preview_image_background"
-                android:contentDescription="@string/latest_crop_title"
-                android:cropToPadding="false"
-                android:padding="2dp"
-                android:scaleType="centerCrop"
-                android:src="@android:drawable/ic_menu_report_image" />
+                android:layout_marginTop="8dp">
+
+                <ImageView
+                    android:id="@+id/latestCropImage"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:adjustViewBounds="true"
+                    android:background="@drawable/preview_image_background"
+                    android:contentDescription="@string/latest_crop_title"
+                    android:cropToPadding="false"
+                    android:padding="2dp"
+                    android:scaleType="centerCrop"
+                    android:src="@android:drawable/ic_menu_report_image" />
+
+                <ImageView
+                    android:id="@+id/validationIndicator"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:layout_gravity="bottom|end"
+                    android:layout_margin="4dp"
+                    android:visibility="gone" />
+            </FrameLayout>
 
             <TextView
                 android:id="@+id/latestCropCaption"

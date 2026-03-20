@@ -14,10 +14,12 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.andre.alprprototype.alpr.AlprPipeline
 import com.andre.alprprototype.alpr.BestPlateCropSaver
 import com.andre.alprprototype.alpr.YoloTflitePlateCandidateGenerator
 import com.andre.alprprototype.databinding.ActivityCameraBinding
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -42,6 +44,7 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var cropSaver: BestPlateCropSaver
     private lateinit var pipeline: AlprPipeline
     private lateinit var trainingLogUploader: TrainingLogUploader
+    private lateinit var registryManager: RegistryManager
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
     private var latestFrame: AnalyzedFrame? = null
@@ -74,6 +77,7 @@ class CameraActivity : AppCompatActivity() {
         cropSaver = BestPlateCropSaver(this)
         pipeline = AlprPipeline.create(this)
         plateOcrEngine = PlateOcrEngine(this)
+        registryManager = RegistryManager(this)
         trainingLogUploader = TrainingLogUploader(this) { message ->
             if (canUpdateUi()) {
                 showTopToast(message)
@@ -89,10 +93,29 @@ class CameraActivity : AppCompatActivity() {
             applyStatusPanelState()
         }
 
+        binding.syncButton.setOnClickListener {
+            syncRegistry()
+        }
+
         if (hasCameraPermission()) {
             startCamera()
         } else {
             permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun syncRegistry() {
+        binding.syncButton.isEnabled = false
+        binding.syncButton.text = "Syncing..."
+        lifecycleScope.launch {
+            val result = registryManager.syncRegistry()
+            if (result.isSuccess) {
+                Toast.makeText(this@CameraActivity, "Registry synced: ${result.getOrNull()} plates", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this@CameraActivity, "Sync failed", Toast.LENGTH_SHORT).show()
+            }
+            binding.syncButton.isEnabled = true
+            binding.syncButton.text = "Sync Registry"
         }
     }
 
@@ -242,10 +265,37 @@ class CameraActivity : AppCompatActivity() {
                 latestOcrResult = result
                 latestOcrState = if (result?.text.isNullOrBlank()) OcrUiState.UNAVAILABLE else OcrUiState.READY
                 updateCropCaption()
+
+                // Validate against registry
+                result?.text?.let { text ->
+                    val validation = registryManager.isPlateValid(text)
+                    updateValidationUi(validation)
+                } ?: run {
+                    binding.validationIndicator.visibility = android.view.View.GONE
+                }
+
                 maybeUploadTrainingSample(cropPath, result, frameState)
                 latestFrame?.let { frame ->
                     binding.sessionStatus.text = buildStatusText(frame)
                 }
+            }
+        }
+    }
+
+    private fun updateValidationUi(result: RegistryManager.PlateValidationResult) {
+        binding.validationIndicator.visibility = android.view.View.VISIBLE
+        when (result) {
+            RegistryManager.PlateValidationResult.VALID -> {
+                binding.validationIndicator.setImageResource(android.R.drawable.presence_online) // Green dot/checkmark proxy
+                binding.validationIndicator.setColorFilter(android.graphics.Color.GREEN)
+            }
+            RegistryManager.PlateValidationResult.EXPIRED -> {
+                binding.validationIndicator.setImageResource(android.R.drawable.presence_busy) // Red proxy
+                binding.validationIndicator.setColorFilter(android.graphics.Color.YELLOW) // Warning for expired
+            }
+            RegistryManager.PlateValidationResult.NOT_FOUND -> {
+                binding.validationIndicator.setImageResource(android.R.drawable.presence_offline) // Red proxy
+                binding.validationIndicator.setColorFilter(android.graphics.Color.RED)
             }
         }
     }

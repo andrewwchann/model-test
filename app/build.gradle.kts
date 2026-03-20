@@ -42,7 +42,7 @@ android {
         buildConfigField(
             "boolean",
             "TRAINING_LOGGER_WIFI_ONLY",
-            booleanProperty("trainingLoggerWifiOnly", false).toString(),
+            booleanProperty("trainingLoggingEnabled", false).toString(),
         )
         buildConfigField(
             "double",
@@ -92,4 +92,9 @@ dependencies {
     implementation("androidx.camera:camera-view:$cameraxVersion")
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+
+    // Networking
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 }
