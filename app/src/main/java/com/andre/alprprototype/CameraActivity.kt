@@ -9,9 +9,13 @@ import android.util.Size
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
@@ -54,6 +58,8 @@ class CameraActivity : AppCompatActivity() {
     private var latestOcrResult: OcrDisplayResult? = null
     private var latestOcrState: OcrUiState = OcrUiState.IDLE
     private var detectorSelfTestSummary: String = "Self-test: pending"
+    private var lastConfirmedPlateText: String? = null
+    private var lastConfirmedPlateAtMs: Long = 0L
     private lateinit var plateOcrEngine: PlateOcrEngine
     private var isStatusExpanded: Boolean = false
     private val isShuttingDown = AtomicBoolean(false)
@@ -143,8 +149,23 @@ class CameraActivity : AppCompatActivity() {
                     .build()
                     .also { it.setSurfaceProvider(binding.previewView.surfaceProvider) }
 
+                val analysisResolutionSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(800, 800),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
+                        ),
+                    )
+                    .setAspectRatioStrategy(
+                        AspectRatioStrategy(
+                            AspectRatio.RATIO_4_3,
+                            AspectRatioStrategy.FALLBACK_RULE_AUTO,
+                        ),
+                    )
+                    .build()
+
                 val analysis = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(1280, 720))
+                    .setResolutionSelector(analysisResolutionSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also { imageAnalysis ->
@@ -266,15 +287,19 @@ class CameraActivity : AppCompatActivity() {
                 latestOcrState = if (result?.text.isNullOrBlank()) OcrUiState.UNAVAILABLE else OcrUiState.READY
                 updateCropCaption()
 
-                // Validate against registry
-                result?.text?.let { text ->
-                    val validation = registryManager.isPlateValid(text)
-                    updateValidationUi(validation)
-                } ?: run {
+                val allowConfirmedActions = result?.text?.let { text ->
+                    shouldProcessConfirmedPlate(text)
+                } ?: false
+
+                if (allowConfirmedActions) {
+                    result?.text?.let { text ->
+                        val validation = registryManager.isPlateValid(text)
+                        updateValidationUi(validation)
+                    }
+                    maybeUploadTrainingSample(cropPath, result, frameState)
+                } else {
                     binding.validationIndicator.visibility = android.view.View.GONE
                 }
-
-                maybeUploadTrainingSample(cropPath, result, frameState)
                 latestFrame?.let { frame ->
                     binding.sessionStatus.text = buildStatusText(frame)
                 }
@@ -356,16 +381,6 @@ class CameraActivity : AppCompatActivity() {
         if (normalizedOcr.isBlank()) {
             return UploadDecision(false, "blank_ocr")
         }
-        val emittedResult = frameState.emittedResult
-        if (emittedResult != null) {
-            if (emittedResult.supportingFrames < 3) {
-                return UploadDecision(false, "insufficient_support")
-            }
-            val normalizedFinal = normalizePlateTextForUpload(emittedResult.text)
-            if (normalizedFinal.isBlank() || normalizedOcr != normalizedFinal) {
-                return UploadDecision(false, "ocr_final_mismatch")
-            }
-        }
         if (!isPlausiblePlateText(normalizedOcr)) {
             return UploadDecision(false, "implausible_text")
         }
@@ -379,6 +394,26 @@ class CameraActivity : AppCompatActivity() {
     private fun normalizePlateTextForUpload(text: String): String {
         return text.uppercase()
             .filter { it in 'A'..'Z' || it in '0'..'9' }
+    }
+
+    private fun shouldProcessConfirmedPlate(text: String): Boolean {
+        val normalizedText = normalizePlateTextForUpload(text)
+        if (normalizedText.isBlank()) {
+            return false
+        }
+        val nowMs = System.currentTimeMillis()
+        val isRepeatedPlate = normalizedText == lastConfirmedPlateText
+        val withinCooldown = nowMs - lastConfirmedPlateAtMs < CONFIRMED_PLATE_COOLDOWN_MS
+        if (isRepeatedPlate && withinCooldown) {
+            android.util.Log.d(
+                "ConfirmedPlateCooldown",
+                "suppressed text=$normalizedText ageMs=${nowMs - lastConfirmedPlateAtMs}",
+            )
+            return false
+        }
+        lastConfirmedPlateText = normalizedText
+        lastConfirmedPlateAtMs = nowMs
+        return true
     }
 
     private fun isPlausiblePlateText(text: String): Boolean {
@@ -401,12 +436,11 @@ class CameraActivity : AppCompatActivity() {
         frameState: com.andre.alprprototype.alpr.PipelineDebugState,
         decision: UploadDecision,
     ) {
-        val emitted = frameState.emittedResult
         val quality = frameState.quality
         android.util.Log.d(
             "TrainingUploadGate",
             "decision=${decision.reason} path=$cropPath ocr='${ocrResult.text}' conf=${ocrResult.confidence} " +
-                "final='${emitted?.text}' votes=${emitted?.supportingFrames} trackAge=${frameState.activeTrack?.ageFrames} " +
+                "trackAge=${frameState.activeTrack?.ageFrames} " +
                 "quality=${quality?.totalScore}",
         )
     }
@@ -431,5 +465,9 @@ class CameraActivity : AppCompatActivity() {
             setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 120)
             show()
         }
+    }
+
+    companion object {
+        private const val CONFIRMED_PLATE_COOLDOWN_MS = 8_000L
     }
 }
