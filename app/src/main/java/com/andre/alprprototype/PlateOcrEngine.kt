@@ -24,6 +24,7 @@ data class OcrDisplayResult(
 
 class PlateOcrEngine(context: Context) {
     private val tag = "PlateOcrEngine"
+    private val perfTag = "ALPR_PERF"
     private val env = OrtEnvironment.getEnvironment()
     private val config = loadPlateConfig(context, "ocr/plate_config.yaml")
     private val session = env.createSession(
@@ -54,17 +55,26 @@ class PlateOcrEngine(context: Context) {
                 onResult(null)
                 return@execute
             }
+            val totalStartNs = System.nanoTime()
             val result = try {
                 val file = File(cropPath)
+                val decodeStartNs = System.nanoTime()
                 val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                val decodeDurationMs = nanosToMillis(System.nanoTime() - decodeStartNs)
                 if (!file.exists() || bitmap == null) {
+                    Log.d(perfTag, "ocr file=${file.name} decodeMs=$decodeDurationMs result=missing")
                     null
                 } else {
                     var bestResult: ScoredOcrCandidate? = null
                     val variants = buildVariants(bitmap)
+                    var inferenceDurationMs = 0L
+                    var variantsTried = 0
                     
                     for (variant in variants) {
+                        variantsTried += 1
+                        val inferenceStartNs = System.nanoTime()
                         val current = runInference(variant, file.absolutePath)
+                        inferenceDurationMs += nanosToMillis(System.nanoTime() - inferenceStartNs)
                         if (current != null) {
                             if (bestResult == null || current.score > bestResult.score) {
                                 bestResult = current
@@ -77,6 +87,13 @@ class PlateOcrEngine(context: Context) {
                             }
                         }
                     }
+
+                    val totalDurationMs = nanosToMillis(System.nanoTime() - totalStartNs)
+                    Log.d(
+                        perfTag,
+                        "ocr file=${file.name} decodeMs=$decodeDurationMs inferMs=$inferenceDurationMs " +
+                            "variants=$variantsTried text='${bestResult?.text ?: ""}' totalMs=$totalDurationMs",
+                    )
 
                     bestResult?.let {
                         OcrDisplayResult(
@@ -315,3 +332,5 @@ private fun copyAssetToCache(context: Context, assetPath: String): File {
     }
     return outFile
 }
+
+private fun nanosToMillis(durationNs: Long): Long = durationNs / 1_000_000L

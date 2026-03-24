@@ -172,10 +172,15 @@ class TrainingLogUploader(
     }
 
     private fun isOnUnmeteredWifi(): Boolean {
-        val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java) ?: return false
-        val network = connectivityManager.activeNetwork ?: return false
-        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
-        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
-            !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED).not()
+        return try {
+            val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java) ?: return false
+            val network = connectivityManager.activeNetwork ?: return false
+            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        } catch (t: SecurityException) {
+            Log.w(tag, "network state unavailable; treating Wi-Fi-only check as unmet", t)
+            false
+        }
     }
 }

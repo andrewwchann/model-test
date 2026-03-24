@@ -1,9 +1,9 @@
 package com.andre.alprprototype.alpr
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.RectF
 import androidx.camera.core.ImageProxy
-import java.util.ArrayDeque
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
@@ -37,18 +37,6 @@ data class PlateQuality(
     val totalScore: Float,
 )
 
-data class OcrCandidate(
-    val text: String,
-    val confidence: Float,
-    val engine: String,
-)
-
-data class FinalPlateResult(
-    val text: String,
-    val confidence: Float,
-    val supportingFrames: Int,
-)
-
 data class PipelineDebugState(
     val frameNumber: Long,
     val inputWidth: Int,
@@ -59,8 +47,6 @@ data class PipelineDebugState(
     val detections: List<PlateDetection>,
     val activeTrack: PlateTrack?,
     val quality: PlateQuality?,
-    val bestCandidate: OcrCandidate?,
-    val emittedResult: FinalPlateResult?,
     val detectorDebugText: String?,
 ) {
     fun statusText(): String {
@@ -94,16 +80,6 @@ data class PipelineDebugState(
         val reasonText = quality?.reasons?.takeIf { it.isNotEmpty() }?.joinToString() ?: "none"
         lines += "Reject reasons: $reasonText"
 
-        val ocrText = bestCandidate?.let {
-            "Best OCR: ${it.text} (${format(it.confidence)}) via ${it.engine}"
-        } ?: "Best OCR: none"
-        lines += ocrText
-
-        val finalText = emittedResult?.let {
-            "Final plate: ${it.text} (${format(it.confidence)}) votes=${it.supportingFrames}"
-        } ?: "Final plate: not emitted"
-        lines += finalText
-
         return lines.joinToString("\n")
     }
 }
@@ -113,26 +89,25 @@ class AlprPipeline(
     private val candidateFilter: PlateCandidateFilter = PlateLikeCandidateFilter(),
     private val tracker: PlateTracker = SimplePlateTracker(),
     private val qualityScorer: PlateQualityScorer = HeuristicPlateQualityScorer(),
-    private val ocrEngine: PlateOcrEngine = NoopPlateOcrEngine(),
-    private val voteWindowSize: Int = 4,   // Speed: Smaller window for faster confirmation
-    private val voteThreshold: Int = 2,    // Speed/Reliability: 2 matching frames for quick but verified result
-    private val scanEveryNFrames: Int = 4, // Speed: Scan more frequently than 6
+    private val scanEveryNFrames: Int = 4,
 ) : AutoCloseable {
     val detectorName: String
         get() = candidateGenerator.name
 
-    private val voteWindow = ArrayDeque<OcrCandidate>()
-    private var bestCandidate: OcrCandidate? = null
-    private var bestQualityScore = 0f
     private var lastTrackId: Int? = null
 
-    fun process(frameNumber: Long, image: ImageProxy): PipelineDebugState {
+    fun process(
+        frameNumber: Long,
+        image: ImageProxy,
+        uprightBitmapProvider: (() -> Bitmap?)? = null,
+    ): PipelineDebugState {
+        val (displayWidth, displayHeight) = uprightFrameSize(image)
         // Speed: Allow frequent scans if we don't have an active track
         val hasTrack = tracker.hasActiveTrack()
         val effectiveScanInterval = if (hasTrack) scanEveryNFrames else max(1, scanEveryNFrames / 2)
         val runScan = ((frameNumber - 1L) % effectiveScanInterval.toLong()) == 0L
         
-        val candidates = if (runScan) candidateGenerator.generate(image) else emptyList()
+        val candidates = if (runScan) candidateGenerator.generate(image, uprightBitmapProvider) else emptyList()
         val detections = if (runScan) candidateFilter.filter(candidates, image) else emptyList()
         val activeTrack = tracker.update(detections)
         
@@ -143,59 +118,17 @@ class AlprPipeline(
         
         val quality = activeTrack?.let { qualityScorer.score(image, it) }
 
-        // Reliability: Only send to OCR if quality is high enough
-        val acceptedCandidate = quality
-            ?.takeIf { it.passes }
-            ?.let { passingQuality -> ocrEngine.recognize(activeTrack, passingQuality) }
-
-        if (acceptedCandidate != null && quality.totalScore >= bestQualityScore) {
-            bestQualityScore = quality.totalScore
-            bestCandidate = acceptedCandidate
-        }
-
-        if (acceptedCandidate != null) {
-            voteWindow.addLast(acceptedCandidate)
-            while (voteWindow.size > voteWindowSize) {
-                voteWindow.removeFirst()
-            }
-        }
-
-        val emittedResult = buildFinalResult()
-
         return PipelineDebugState(
             frameNumber = frameNumber,
-            inputWidth = image.width,
-            inputHeight = image.height,
+            inputWidth = displayWidth,
+            inputHeight = displayHeight,
             scanRan = runScan,
             candidateSource = candidateGenerator.name,
             candidates = candidates,
             detections = detections,
             activeTrack = activeTrack,
             quality = quality,
-            bestCandidate = bestCandidate,
-            emittedResult = emittedResult,
             detectorDebugText = candidateGenerator.lastDebugInfo(),
-        )
-    }
-
-    private fun buildFinalResult(): FinalPlateResult? {
-        if (voteWindow.isEmpty()) return null
-
-        val votes = voteWindow.groupingBy { it.text }.eachCount()
-        val winner = votes.maxByOrNull { it.value } ?: return null
-        
-        // Reliability Pillar: Use voting to ensure accuracy
-        if (winner.value < voteThreshold) return null
-
-        val confidences = voteWindow
-            .filter { it.text == winner.key }
-            .map { it.confidence }
-        val avgConfidence = confidences.average().toFloat()
-
-        return FinalPlateResult(
-            text = winner.key,
-            confidence = avgConfidence,
-            supportingFrames = winner.value,
         )
     }
 
@@ -204,18 +137,17 @@ class AlprPipeline(
     }
 
     private fun resetRecognitionState() {
-        voteWindow.clear()
-        bestCandidate = null
-        bestQualityScore = 0f
+        // The live OCR flow runs on saved crops in CameraActivity, so the frame pipeline
+        // only needs to reset track-local state here.
     }
 
     companion object {
         fun create(context: Context): AlprPipeline {
             val candidateGenerator = YoloTflitePlateCandidateGenerator.createOrNull(context)
                 ?: StaticSceneCandidateGenerator()
-            
-            // Speed: Adaptive scan rates based on hardware capability
-            val scanEveryNFrames = if (candidateGenerator is YoloTflitePlateCandidateGenerator) 2 else 4
+
+            // Middle ground: every 2nd frame while acquiring and every 4th frame when tracked.
+            val scanEveryNFrames = if (candidateGenerator is YoloTflitePlateCandidateGenerator) 4 else 6
             
             return AlprPipeline(
                 candidateGenerator = candidateGenerator,
@@ -227,7 +159,7 @@ class AlprPipeline(
 
 interface PlateCandidateGenerator {
     val name: String
-    fun generate(image: ImageProxy): List<PlateCandidate>
+    fun generate(image: ImageProxy, uprightBitmapProvider: (() -> Bitmap?)? = null): List<PlateCandidate>
     fun close() = Unit
     fun lastDebugInfo(): String? = null
 }
@@ -245,15 +177,10 @@ interface PlateQualityScorer {
     fun score(image: ImageProxy, track: PlateTrack): PlateQuality
 }
 
-interface PlateOcrEngine {
-    val engineName: String
-    fun recognize(track: PlateTrack, quality: PlateQuality): OcrCandidate?
-}
-
 class StaticSceneCandidateGenerator : PlateCandidateGenerator {
     override val name: String = "static-region-proposals"
 
-    override fun generate(image: ImageProxy): List<PlateCandidate> {
+    override fun generate(image: ImageProxy, uprightBitmapProvider: (() -> Bitmap?)?): List<PlateCandidate> {
         val plane = image.planes.firstOrNull() ?: return emptyList()
         val frameWidth = image.width
         val frameHeight = image.height
@@ -401,7 +328,7 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
 
 class PlateLikeCandidateFilter : PlateCandidateFilter {
     override fun filter(candidates: List<PlateCandidate>, image: ImageProxy): List<PlateDetection> {
-        val minWidth = image.width * 0.10f
+        val minWidth = image.width * 0.12f
         return candidates.mapNotNull { candidate ->
             val width = candidate.boundingBox.width()
             val height = candidate.boundingBox.height()
@@ -411,16 +338,32 @@ class PlateLikeCandidateFilter : PlateCandidateFilter {
             if (candidate.source == "yolo-tflite") {
                 val yoloMinWidth = image.width * 0.07f
                 val aspectPass = aspectRatio in 1.4f..8.0f
-                if (width < yoloMinWidth || !aspectPass) null
-                else PlateDetection(candidate.boundingBox, candidate.confidence, candidate.source)
+                val centeredPass = centeredness >= 0.01f
+                if (width < yoloMinWidth || !aspectPass || !centeredPass) {
+                    null
+                } else {
+                    PlateDetection(
+                        boundingBox = candidate.boundingBox,
+                        confidence = min(0.99f, candidate.confidence * 0.9f + 0.09f),
+                        source = candidate.source,
+                    )
+                }
             } else {
-                // Reliability: Stricter aspect ratios for plates (usually ~4:1)
-                val aspectPass = aspectRatio in 2.2f..6.8f
+                val aspectPass = aspectRatio in 2.4f..6.4f
                 val sizePass = width >= minWidth
-                val centeredPass = centeredness >= 0.25f
+                val centeredPass = centeredness >= 0.35f
 
-                if (!aspectPass || !sizePass || !centeredPass) null
-                else PlateDetection(candidate.boundingBox, candidate.confidence, candidate.source)
+                if (!aspectPass || !sizePass || !centeredPass) {
+                    null
+                } else {
+                    val confidence = min(
+                        0.99f,
+                        candidate.confidence * 0.7f +
+                            normalized(aspectRatio, 2.4f, 4.8f) * 0.2f +
+                            centeredness * 0.1f,
+                    )
+                    PlateDetection(candidate.boundingBox, confidence, candidate.source)
+                }
             }
         }
     }
@@ -448,6 +391,7 @@ class SimplePlateTracker : PlateTracker {
             missedDetections = 0
             val previousTrack = activeTrack
             val continuesTrack = previousTrack != null &&
+                previousTrack.source == best.source &&
                 overlaps(previousTrack.boundingBox, best.boundingBox) >= IOU_CONTINUITY_THRESHOLD
             
             if (continuesTrack) {
@@ -470,7 +414,7 @@ class SimplePlateTracker : PlateTracker {
 
     companion object {
         private const val IOU_CONTINUITY_THRESHOLD = 0.25f
-        private const val MAX_MISSED_DETECTIONS = 3 // Reliability: Keep track alive slightly longer
+        private const val MAX_MISSED_DETECTIONS = 3
     }
 }
 
@@ -478,20 +422,25 @@ class HeuristicPlateQualityScorer : PlateQualityScorer {
     override fun score(image: ImageProxy, track: PlateTrack): PlateQuality {
         val plateWidth = track.boundingBox.width()
         val plateHeight = track.boundingBox.height()
-        val minRequiredWidth = if (track.source == "yolo-tflite") image.width * 0.07f else image.width * 0.14f
-        val blurTargetWidth = if (track.source == "yolo-tflite") image.width * 0.15f else image.width * 0.25f
+        val minRequiredWidth = if (track.source == "yolo-tflite") image.width * 0.08f else image.width * 0.16f
+        val blurTargetWidth = if (track.source == "yolo-tflite") image.width * 0.18f else image.width * 0.28f
         val blurScore = min(1f, plateWidth / blurTargetWidth)
         val targetAspect = 4.4f
         val actualAspect = plateWidth / max(plateHeight, 1f)
         val angleScore = max(0f, 1f - abs(actualAspect - targetAspect) / targetAspect)
 
         val reasons = mutableListOf<String>()
-        if (plateWidth < minRequiredWidth) reasons += "tiny-box"
-        // Reliability: Only reject if severely blurred or wrong shape
-        if (blurScore < 0.25f) reasons += "blur"
-        if (angleScore < 0.30f) reasons += "aspect-angle"
+        if (plateWidth < minRequiredWidth) {
+            reasons += "tiny-box"
+        }
+        if (blurScore < if (track.source == "yolo-tflite") 0.30f else 0.45f) {
+            reasons += "blur"
+        }
+        if (angleScore < if (track.source == "yolo-tflite") 0.35f else 0.60f) {
+            reasons += "aspect-angle"
+        }
 
-        val totalScore = (blurScore * 0.40f) + ((plateWidth / image.width) * 0.40f) + (angleScore * 0.20f)
+        val totalScore = (blurScore * 0.45f) + ((plateWidth / image.width) * 0.35f) + (angleScore * 0.20f)
 
         return PlateQuality(
             blurScore = blurScore,
@@ -504,20 +453,6 @@ class HeuristicPlateQualityScorer : PlateQualityScorer {
     }
 }
 
-class PaddleOcrEngine : PlateOcrEngine {
-    override val engineName: String = "PaddleOCR placeholder"
-
-    override fun recognize(track: PlateTrack, quality: PlateQuality): OcrCandidate {
-        val text = if (track.ageFrames % 5 == 0) "ABC128" else "ABC123"
-        val confidence = min(0.98f, 0.52f + quality.totalScore)
-        return OcrCandidate(text = text, confidence = confidence, engine = engineName)
-    }
-}
-
-class NoopPlateOcrEngine : PlateOcrEngine {
-    override val engineName: String = "external-ocr"
-    override fun recognize(track: PlateTrack, quality: PlateQuality): OcrCandidate? = null
-}
 
 private fun normalized(value: Float, minValue: Float, maxValue: Float): Float {
     if (maxValue <= minValue) return 0f
@@ -540,6 +475,15 @@ private fun overlaps(a: RectF, b: RectF): Float {
     val intersection = (right - left) * (bottom - top)
     val union = a.width() * a.height() + b.width() * b.height() - intersection
     return if (union <= 0f) 0f else intersection / union
+}
+
+private fun uprightFrameSize(image: ImageProxy): Pair<Int, Int> {
+    val normalizedRotation = ((image.imageInfo.rotationDegrees % 360) + 360) % 360
+    return if (normalizedRotation == 90 || normalizedRotation == 270) {
+        image.height to image.width
+    } else {
+        image.width to image.height
+    }
 }
 
 private fun RectF.asDebugString(): String = String.format(Locale.US, "[%.0f, %.0f, %.0f, %.0f]", left, top, right, bottom)
