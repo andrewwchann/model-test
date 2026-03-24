@@ -20,11 +20,13 @@ data class OcrDisplayResult(
     val text: String,
     val sourcePath: String,
     val confidence: Float?,
+    val agreementCount: Int,
+    val variantCount: Int,
+    val scoreMargin: Float?,
 )
 
 class PlateOcrEngine(context: Context) {
     private val tag = "PlateOcrEngine"
-    private val perfTag = "ALPR_PERF"
     private val env = OrtEnvironment.getEnvironment()
     private val config = loadPlateConfig(context, "ocr/plate_config.yaml")
     private val session = env.createSession(
@@ -62,10 +64,12 @@ class PlateOcrEngine(context: Context) {
                 val bitmap = BitmapFactory.decodeFile(file.absolutePath)
                 val decodeDurationMs = nanosToMillis(System.nanoTime() - decodeStartNs)
                 if (!file.exists() || bitmap == null) {
-                    Log.d(perfTag, "ocr file=${file.name} decodeMs=$decodeDurationMs result=missing")
+                    if (BuildConfig.ALPR_PERF_LOGS_ENABLED) {
+                        Log.d("ALPR_PERF", "ocr file=${file.name} decodeMs=$decodeDurationMs result=missing")
+                    }
                     null
                 } else {
-                    var bestResult: ScoredOcrCandidate? = null
+                    val candidates = mutableListOf<ScoredOcrCandidate>()
                     val variants = buildVariants(bitmap)
                     var inferenceDurationMs = 0L
                     var variantsTried = 0
@@ -76,30 +80,45 @@ class PlateOcrEngine(context: Context) {
                         val current = runInference(variant, file.absolutePath)
                         inferenceDurationMs += nanosToMillis(System.nanoTime() - inferenceStartNs)
                         if (current != null) {
-                            if (bestResult == null || current.score > bestResult.score) {
-                                bestResult = current
-                            }
-                            // Speed Pillar: If we have a very high confidence result, 
+                            candidates += current
+                            val bestSoFar = candidates.maxByOrNull { it.score }
+                            // Exit early once a very confident OCR result is found.
                             // exit early to save CPU/Time.
-                            if (current.confidence >= 0.92f) {
-                                Log.d(tag, "Fast-exit OCR with confidence ${current.confidence}")
+                            if (bestSoFar != null && current.confidence >= 0.92f) {
                                 break
                             }
                         }
                     }
 
-                    val totalDurationMs = nanosToMillis(System.nanoTime() - totalStartNs)
-                    Log.d(
-                        perfTag,
-                        "ocr file=${file.name} decodeMs=$decodeDurationMs inferMs=$inferenceDurationMs " +
-                            "variants=$variantsTried text='${bestResult?.text ?: ""}' totalMs=$totalDurationMs",
-                    )
+                    val bestResult = candidates.maxByOrNull { it.score }
+                    val agreementCount = bestResult?.let { best ->
+                        candidates.count { it.text == best.text }
+                    } ?: 0
+                    val scoreMargin = bestResult?.let { best ->
+                        val secondBest = candidates
+                            .filterNot { it === best }
+                            .maxByOrNull { it.score }
+                        secondBest?.let { best.score - it.score }
+                    }
+
+                    if (BuildConfig.ALPR_PERF_LOGS_ENABLED) {
+                        val totalDurationMs = nanosToMillis(System.nanoTime() - totalStartNs)
+                        Log.d(
+                            "ALPR_PERF",
+                            "ocr file=${file.name} decodeMs=$decodeDurationMs inferMs=$inferenceDurationMs " +
+                                "variants=$variantsTried agree=$agreementCount margin=${scoreMargin ?: -1f} " +
+                                "text='${bestResult?.text ?: ""}' totalMs=$totalDurationMs",
+                        )
+                    }
 
                     bestResult?.let {
                         OcrDisplayResult(
                             text = it.text,
                             sourcePath = file.absolutePath,
                             confidence = it.confidence,
+                            agreementCount = agreementCount,
+                            variantCount = variantsTried,
+                            scoreMargin = scoreMargin,
                         )
                     }
                 }

@@ -329,14 +329,18 @@ class StaticSceneCandidateGenerator : PlateCandidateGenerator {
 class PlateLikeCandidateFilter : PlateCandidateFilter {
     override fun filter(candidates: List<PlateCandidate>, image: ImageProxy): List<PlateDetection> {
         val minWidth = image.width * 0.12f
+        val uprightFrameWidth = uprightFrameSize(image).first.toFloat()
         return candidates.mapNotNull { candidate ->
             val width = candidate.boundingBox.width()
             val height = candidate.boundingBox.height()
             val aspectRatio = width / max(height, 1f)
-            val centeredness = centeredness(candidate.boundingBox, image.width.toFloat())
+            val centeredness = centeredness(
+                candidate.boundingBox,
+                if (candidate.source == "yolo-tflite") uprightFrameWidth else image.width.toFloat(),
+            )
 
             if (candidate.source == "yolo-tflite") {
-                val yoloMinWidth = image.width * 0.07f
+                val yoloMinWidth = uprightFrameWidth * 0.07f
                 val aspectPass = aspectRatio in 1.4f..8.0f
                 val centeredPass = centeredness >= 0.01f
                 if (width < yoloMinWidth || !aspectPass || !centeredPass) {
@@ -422,8 +426,10 @@ class HeuristicPlateQualityScorer : PlateQualityScorer {
     override fun score(image: ImageProxy, track: PlateTrack): PlateQuality {
         val plateWidth = track.boundingBox.width()
         val plateHeight = track.boundingBox.height()
-        val minRequiredWidth = if (track.source == "yolo-tflite") image.width * 0.08f else image.width * 0.16f
-        val blurTargetWidth = if (track.source == "yolo-tflite") image.width * 0.18f else image.width * 0.28f
+        val uprightFrameWidth = uprightFrameSize(image).first.toFloat()
+        val frameWidth = if (track.source == "yolo-tflite") uprightFrameWidth else image.width.toFloat()
+        val minRequiredWidth = if (track.source == "yolo-tflite") frameWidth * 0.08f else frameWidth * 0.16f
+        val blurTargetWidth = if (track.source == "yolo-tflite") frameWidth * 0.18f else frameWidth * 0.28f
         val blurScore = min(1f, plateWidth / blurTargetWidth)
         val targetAspect = 4.4f
         val actualAspect = plateWidth / max(plateHeight, 1f)
@@ -440,7 +446,7 @@ class HeuristicPlateQualityScorer : PlateQualityScorer {
             reasons += "aspect-angle"
         }
 
-        val totalScore = (blurScore * 0.45f) + ((plateWidth / image.width) * 0.35f) + (angleScore * 0.20f)
+        val totalScore = (blurScore * 0.45f) + ((plateWidth / frameWidth) * 0.35f) + (angleScore * 0.20f)
 
         return PlateQuality(
             blurScore = blurScore,

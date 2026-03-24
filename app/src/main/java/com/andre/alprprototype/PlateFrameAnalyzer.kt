@@ -22,8 +22,6 @@ class PlateFrameAnalyzer(
 ) : ImageAnalysis.Analyzer {
 
     private val frameCounter = AtomicLong(0)
-    private val perfTag = "ALPR_PERF"
-
     override fun analyze(image: ImageProxy) {
         try {
             val currentFrame = frameCounter.incrementAndGet()
@@ -41,13 +39,15 @@ class PlateFrameAnalyzer(
             val cropStartNs = System.nanoTime()
             val savedCropPath = cropSaver.saveIfBest(image, state, bitmapProvider)
             val cropDurationMs = nanosToMillis(System.nanoTime() - cropStartNs)
-            val totalDurationMs = (convertDurationMs ?: 0L) + pipelineDurationMs + cropDurationMs
-            Log.d(
-                perfTag,
-                "frame=$currentFrame scan=${state.scanRan} convertMs=${convertDurationMs ?: 0} " +
-                    "pipelineMs=$pipelineDurationMs cropMs=$cropDurationMs saved=${savedCropPath != null} " +
-                    "track=${state.activeTrack?.trackId ?: 0} totalMs=$totalDurationMs",
-            )
+            if (BuildConfig.ALPR_PERF_LOGS_ENABLED) {
+                val totalDurationMs = (convertDurationMs ?: 0L) + pipelineDurationMs + cropDurationMs
+                Log.d(
+                    "ALPR_PERF",
+                    "frame=$currentFrame scan=${state.scanRan} convertMs=${convertDurationMs ?: 0} " +
+                        "pipelineMs=$pipelineDurationMs cropMs=$cropDurationMs saved=${savedCropPath != null} " +
+                        "track=${state.activeTrack?.trackId ?: 0} totalMs=$totalDurationMs",
+                )
+            }
             onFrameAnalyzed(AnalyzedFrame(state = state, savedCropPath = savedCropPath))
         } catch (_: Throwable) {
             // Keep CameraX alive even if OCR/crop plumbing throws for a frame.
