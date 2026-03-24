@@ -47,7 +47,12 @@ android {
         buildConfigField(
             "double",
             "TRAINING_LOGGER_MIN_CONFIDENCE",
-            stringProperty("trainingLoggerMinConfidence", "0.0"),
+            stringProperty("trainingLoggerMinConfidence", "0.75"),
+        )
+        buildConfigField(
+            "boolean",
+            "ALPR_PERF_LOGS_ENABLED",
+            booleanProperty("alprPerfLogsEnabled", false).toString(),
         )
     }
 

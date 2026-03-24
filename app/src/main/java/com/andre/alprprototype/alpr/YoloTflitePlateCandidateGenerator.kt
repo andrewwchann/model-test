@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.RectF
 import android.util.Log
 import androidx.camera.core.ImageProxy
+import com.andre.alprprototype.BuildConfig
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
@@ -21,15 +22,20 @@ class YoloTflitePlateCandidateGenerator private constructor(
 ) : PlateCandidateGenerator {
 
     override val name: String = "yolo-tflite"
-    private val perfTag = "ALPR_PERF"
     private var lastDebugText: String? = null
 
     override fun generate(image: ImageProxy, uprightBitmapProvider: (() -> Bitmap?)?): List<PlateCandidate> {
         val bitmap = uprightBitmapProvider?.invoke() ?: image.toUprightBitmap() ?: return emptyList()
         val detectStartNs = System.nanoTime()
         val detections = detectOnUprightBitmap(bitmap) ?: return emptyList()
-        val detectDurationMs = (System.nanoTime() - detectStartNs) / 1_000_000L
-        Log.d(perfTag, "detect src=${image.width}x${image.height} upright=${bitmap.width}x${bitmap.height} detections=${detections.size} inferMs=$detectDurationMs")
+        if (BuildConfig.ALPR_PERF_LOGS_ENABLED) {
+            val detectDurationMs = (System.nanoTime() - detectStartNs) / 1_000_000L
+            Log.d(
+                "ALPR_PERF",
+                "detect src=${image.width}x${image.height} upright=${bitmap.width}x${bitmap.height} " +
+                    "detections=${detections.size} inferMs=$detectDurationMs",
+            )
+        }
         return detections
             .map { detection ->
                 lastDebugText = buildLiveDebugText(
