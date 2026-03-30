@@ -9,4 +9,7 @@
     <color name="primary">#254441</color>
     <color name="on_primary">#FFFFFF</color>
     <color name="secondary">#B57F50</color>
+    <color name="dialog_button_sync">#FFD166</color>
+    <color name="dialog_button_wifi">#8ECAE6</color>
+    <color name="dialog_button_dismiss">#FF8A80</color>
 </resources>

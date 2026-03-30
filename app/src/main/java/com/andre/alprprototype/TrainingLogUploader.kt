@@ -16,6 +16,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.UUID
 
 data class TrainingLogPayload(
     val secret: String,
@@ -25,9 +26,15 @@ data class TrainingLogPayload(
     val filename: String,
     val source: String = "camera_live",
     val needsReview: Boolean = true,
-    val imageBase64: String,
+    val imagePath: String,
     val correctedLabel: String? = null,
     val notes: String? = null,
+)
+
+data class PendingUploadSyncResult(
+    val attempted: Int,
+    val uploaded: Int,
+    val remaining: Int,
 )
 
 class TrainingLogUploader(
@@ -35,10 +42,18 @@ class TrainingLogUploader(
     private val onUploadStatus: ((String) -> Unit)? = null,
 ) {
     private val appContext = context.applicationContext
+    private val queueStore = PendingTrainingUploadStore(appContext)
+    private val pendingImageDir = File(appContext.filesDir, "pending-training-crops").apply { mkdirs() }
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val isClosed = AtomicBoolean(false)
     private val tag = "TrainingLogUploader"
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun pendingUploadCount(): Int = queueStore.count()
+
+    fun hasPendingUploads(): Boolean = pendingUploadCount() > 0
+
+    fun canSyncPendingUploadsNow(): Boolean = syncAvailability() == SyncAvailability.READY
 
     fun maybeUpload(cropPath: String, ocrResult: OcrDisplayResult) {
         if (!BuildConfig.TRAINING_LOGGING_ENABLED) {
@@ -54,15 +69,11 @@ class TrainingLogUploader(
             notifyStatus("Upload skipped: blank OCR")
             return
         }
+
         val confidence = ocrResult.confidence
         if (confidence != null && confidence < BuildConfig.TRAINING_LOGGER_MIN_CONFIDENCE.toFloat()) {
             Log.d(tag, "skipping upload below confidence threshold path=$cropPath conf=$confidence")
             notifyStatus("Upload skipped: low confidence")
-            return
-        }
-        if (BuildConfig.TRAINING_LOGGER_WIFI_ONLY && !isOnUnmeteredWifi()) {
-            Log.d(tag, "skipping upload because Wi-Fi-only mode is enabled")
-            notifyStatus("Upload skipped: Wi-Fi only")
             return
         }
         if (isClosed.get()) {
@@ -73,6 +84,7 @@ class TrainingLogUploader(
             if (isClosed.get()) {
                 return@execute
             }
+
             val file = File(cropPath)
             if (!file.exists() || !file.isFile) {
                 Log.w(tag, "skipping upload because crop file is missing path=$cropPath")
@@ -81,23 +93,112 @@ class TrainingLogUploader(
             }
 
             val payload = try {
-                TrainingLogPayload(
-                    secret = BuildConfig.TRAINING_LOGGER_SECRET,
-                    timestamp = Instant.now().toString(),
-                    ocrPredicted = ocrResult.text,
-                    confidence = confidence,
-                    filename = file.name,
-                    source = "camera_live",
-                    needsReview = true,
-                    imageBase64 = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP),
-                )
+                buildPayload(file, ocrResult, confidence)
             } catch (t: Throwable) {
                 Log.e(tag, "failed to prepare upload payload path=$cropPath", t)
                 notifyStatus("Upload failed: payload error")
                 return@execute
             }
 
-            upload(payload)
+            when (syncAvailability()) {
+                SyncAvailability.OFFLINE -> {
+                    queuePendingUpload(payload)
+                    notifyStatus("Offline: match saved for Wi-Fi sync")
+                }
+                SyncAvailability.WIFI_REQUIRED -> {
+                    queuePendingUpload(payload)
+                    notifyStatus("Match saved. Connect to Wi-Fi to sync")
+                }
+                SyncAvailability.READY -> {
+                    when (upload(payload)) {
+                        UploadResult.SUCCESS -> {
+                            notifyStatus("Training sample sent")
+                        }
+                        UploadResult.FAILED -> {
+                            queuePendingUpload(payload)
+                            notifyStatus("Upload deferred. Saved for Wi-Fi sync")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun syncPendingUploads(onComplete: ((PendingUploadSyncResult) -> Unit)? = null) {
+        if (!BuildConfig.TRAINING_LOGGING_ENABLED) {
+            val result = PendingUploadSyncResult(attempted = 0, uploaded = 0, remaining = pendingUploadCount())
+            notifyStatus("Training upload disabled")
+            postSyncResult(result, onComplete)
+            return
+        }
+        if (BuildConfig.TRAINING_LOGGER_ENDPOINT.isBlank()) {
+            val result = PendingUploadSyncResult(attempted = 0, uploaded = 0, remaining = pendingUploadCount())
+            notifyStatus("Upload skipped: endpoint missing")
+            postSyncResult(result, onComplete)
+            return
+        }
+
+        val availability = syncAvailability()
+        if (availability != SyncAvailability.READY) {
+            val result = PendingUploadSyncResult(attempted = 0, uploaded = 0, remaining = pendingUploadCount())
+            notifyStatus(
+                when (availability) {
+                    SyncAvailability.OFFLINE -> "Offline: queued uploads stay saved"
+                    SyncAvailability.WIFI_REQUIRED -> "Connect to Wi-Fi to sync queued uploads"
+                    SyncAvailability.READY -> "Queued uploads ready"
+                },
+            )
+            postSyncResult(result, onComplete)
+            return
+        }
+        if (isClosed.get()) {
+            val result = PendingUploadSyncResult(attempted = 0, uploaded = 0, remaining = pendingUploadCount())
+            postSyncResult(result, onComplete)
+            return
+        }
+
+        executor.execute {
+            if (isClosed.get()) {
+                postSyncResult(
+                    PendingUploadSyncResult(attempted = 0, uploaded = 0, remaining = pendingUploadCount()),
+                    onComplete,
+                )
+                return@execute
+            }
+
+            val pendingEntries = queueStore.snapshot()
+            if (pendingEntries.isEmpty()) {
+                val result = PendingUploadSyncResult(attempted = 0, uploaded = 0, remaining = 0)
+                notifyStatus("No queued uploads to sync")
+                postSyncResult(result, onComplete)
+                return@execute
+            }
+
+            val uploadedEntries = mutableListOf<PendingTrainingUploadEntry>()
+            pendingEntries.forEach { entry ->
+                if (isClosed.get()) {
+                    return@forEach
+                }
+                if (upload(entry.payload) == UploadResult.SUCCESS) {
+                    uploadedEntries += entry
+                }
+            }
+            removeUploadedEntries(uploadedEntries)
+
+            val remaining = queueStore.count()
+            val result = PendingUploadSyncResult(
+                attempted = pendingEntries.size,
+                uploaded = uploadedEntries.size,
+                remaining = remaining,
+            )
+            notifyStatus(
+                when {
+                    result.uploaded == 0 -> "Queued uploads not synced. They remain saved"
+                    result.remaining == 0 -> "Synced ${result.uploaded} queued upload(s)"
+                    else -> "Synced ${result.uploaded}; ${result.remaining} still queued"
+                },
+            )
+            postSyncResult(result, onComplete)
         }
     }
 
@@ -105,13 +206,38 @@ class TrainingLogUploader(
         if (!isClosed.compareAndSet(false, true)) {
             return
         }
-        executor.shutdownNow()
-        executor.awaitTermination(300, TimeUnit.MILLISECONDS)
+        executor.shutdown()
+        if (!executor.awaitTermination(1_500, TimeUnit.MILLISECONDS)) {
+            executor.shutdownNow()
+            executor.awaitTermination(300, TimeUnit.MILLISECONDS)
+        }
     }
 
-    private fun upload(payload: TrainingLogPayload) {
+    private fun buildPayload(
+        file: File,
+        ocrResult: OcrDisplayResult,
+        confidence: Float?,
+    ): TrainingLogPayload {
+        return TrainingLogPayload(
+            secret = BuildConfig.TRAINING_LOGGER_SECRET,
+            timestamp = Instant.now().toString(),
+            ocrPredicted = ocrResult.text,
+            confidence = confidence,
+            filename = file.name,
+            source = "camera_live",
+            needsReview = true,
+            imagePath = file.absolutePath,
+        )
+    }
+
+    private fun upload(payload: TrainingLogPayload): UploadResult {
         var connection: HttpURLConnection? = null
         try {
+            val imageFile = File(payload.imagePath)
+            if (!imageFile.exists() || !imageFile.isFile) {
+                Log.w(tag, "upload skipped because staged image is missing path=${payload.imagePath}")
+                return UploadResult.FAILED
+            }
             val requestJson = JSONObject().apply {
                 put("secret", payload.secret)
                 put("timestamp", payload.timestamp)
@@ -122,7 +248,7 @@ class TrainingLogUploader(
                 put("filename", payload.filename)
                 put("source", payload.source)
                 put("needs_review", payload.needsReview)
-                put("image_base64", payload.imageBase64)
+                put("image_base64", Base64.encodeToString(imageFile.readBytes(), Base64.NO_WRAP))
                 put("corrected_label", payload.correctedLabel ?: "")
                 put("notes", payload.notes ?: "")
             }.toString()
@@ -145,18 +271,70 @@ class TrainingLogUploader(
                 stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
             }.getOrDefault("")
 
-            if (responseCode in 200..299) {
+            return if (responseCode in 200..299) {
                 Log.i(tag, "upload ok file=${payload.filename} response=$responseText")
-                notifyStatus("Training sample sent")
+                UploadResult.SUCCESS
             } else {
                 Log.w(tag, "upload failed code=$responseCode file=${payload.filename} response=$responseText")
-                notifyStatus("Upload failed: HTTP $responseCode")
+                UploadResult.FAILED
             }
         } catch (t: Throwable) {
             Log.e(tag, "upload exception file=${payload.filename}", t)
-            notifyStatus("Upload failed: network error")
+            return UploadResult.FAILED
         } finally {
             connection?.disconnect()
+        }
+    }
+
+    private fun queuePendingUpload(payload: TrainingLogPayload) {
+        val stagedPayload = stagePayloadForPending(payload) ?: return
+        queueStore.enqueue(stagedPayload)
+    }
+
+    private fun stagePayloadForPending(payload: TrainingLogPayload): TrainingLogPayload? {
+        val sourceFile = File(payload.imagePath)
+        if (!sourceFile.exists() || !sourceFile.isFile) {
+            Log.w(tag, "cannot stage pending upload because crop file is missing path=${payload.imagePath}")
+            return null
+        }
+
+        val stagedFile = File(pendingImageDir, "${UUID.randomUUID()}_${sourceFile.name}")
+        return try {
+            sourceFile.copyTo(stagedFile, overwrite = false)
+            payload.copy(imagePath = stagedFile.absolutePath)
+        } catch (t: Throwable) {
+            Log.e(tag, "failed to stage pending upload path=${payload.imagePath}", t)
+            null
+        }
+    }
+
+    private fun removeUploadedEntries(entries: List<PendingTrainingUploadEntry>) {
+        if (entries.isEmpty()) {
+            return
+        }
+
+        queueStore.removeByIds(entries.map { it.id })
+        entries.forEach { entry ->
+            runCatching {
+                val imageFile = File(entry.payload.imagePath)
+                if (imageFile.exists()) {
+                    imageFile.delete()
+                }
+            }.onFailure { error ->
+                Log.w(tag, "failed to delete staged upload file path=${entry.payload.imagePath}", error)
+            }
+        }
+    }
+
+    private fun postSyncResult(
+        result: PendingUploadSyncResult,
+        onComplete: ((PendingUploadSyncResult) -> Unit)?,
+    ) {
+        if (onComplete == null) {
+            return
+        }
+        mainHandler.post {
+            onComplete(result)
         }
     }
 
@@ -171,6 +349,29 @@ class TrainingLogUploader(
         }
     }
 
+    private fun syncAvailability(): SyncAvailability {
+        if (!hasNetworkConnection()) {
+            return SyncAvailability.OFFLINE
+        }
+        if (BuildConfig.TRAINING_LOGGER_WIFI_ONLY && !isOnUnmeteredWifi()) {
+            return SyncAvailability.WIFI_REQUIRED
+        }
+        return SyncAvailability.READY
+    }
+
+    private fun hasNetworkConnection(): Boolean {
+        return try {
+            val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java) ?: return false
+            val network = connectivityManager.activeNetwork ?: return false
+            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        } catch (t: SecurityException) {
+            Log.w(tag, "network state unavailable; treating connection as offline", t)
+            false
+        }
+    }
+
     private fun isOnUnmeteredWifi(): Boolean {
         return try {
             val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java) ?: return false
@@ -182,5 +383,16 @@ class TrainingLogUploader(
             Log.w(tag, "network state unavailable; treating Wi-Fi-only check as unmet", t)
             false
         }
+    }
+
+    private enum class SyncAvailability {
+        OFFLINE,
+        WIFI_REQUIRED,
+        READY,
+    }
+
+    private enum class UploadResult {
+        SUCCESS,
+        FAILED,
     }
 }

@@ -1,13 +1,17 @@
 package com.andre.alprprototype
 
 import android.Manifest
-import android.graphics.BitmapFactory
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.os.Bundle
-import android.view.Gravity
+import android.provider.Settings
 import android.util.Size
+import android.view.Gravity
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
@@ -74,6 +78,9 @@ class CameraActivity : AppCompatActivity() {
     private val currentTrackOcrVotes = ArrayDeque<String>()
     private lateinit var plateOcrEngine: PlateOcrEngine
     private var isStatusExpanded: Boolean = false
+    private var isGuideExpanded: Boolean = false
+    private var hasPromptedPendingUploadSyncOnStart: Boolean = false
+    private var promptPendingUploadSyncOnResume: Boolean = false
     private val isShuttingDown = AtomicBoolean(false)
     private var isProcessingViolation = false
 
@@ -81,6 +88,7 @@ class CameraActivity : AppCompatActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
                 startCamera()
+                maybePromptToSyncPendingUploadsOnStart()
             } else {
                 Toast.makeText(this, R.string.camera_permission_required, Toast.LENGTH_LONG).show()
                 finish()
@@ -106,13 +114,26 @@ class CameraActivity : AppCompatActivity() {
         binding.sessionStatus.text = "Detector loaded: ${pipeline.detectorName}\n$detectorSelfTestSummary\nOpening camera stream and ALPR debug pipeline..."
         runDetectorSelfTest()
         applyStatusPanelState()
+        applyGuidePanelState()
         updateUploadButtonText()
 
-        binding.closeButton.setOnClickListener { finish() }
+        binding.closeButton.setOnClickListener { attemptFinishSession() }
         binding.sessionStatusHeader.setOnClickListener {
             isStatusExpanded = !isStatusExpanded
             applyStatusPanelState()
         }
+        binding.guideHeader.setOnClickListener {
+            isGuideExpanded = !isGuideExpanded
+            applyGuidePanelState()
+        }
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    attemptFinishSession()
+                }
+            },
+        )
 
         binding.syncButton.setOnClickListener {
             syncRegistry()
@@ -124,8 +145,17 @@ class CameraActivity : AppCompatActivity() {
 
         if (hasCameraPermission()) {
             startCamera()
+            maybePromptToSyncPendingUploadsOnStart()
         } else {
             permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (promptPendingUploadSyncOnResume) {
+            promptPendingUploadSyncOnResume = false
+            showPendingUploadSyncPrompt(atSessionEnd = false)
         }
     }
 
@@ -497,6 +527,74 @@ class CameraActivity : AppCompatActivity() {
         binding.latestCropCaption.text = ocrText
     }
 
+    private fun maybePromptToSyncPendingUploadsOnStart() {
+        if (hasPromptedPendingUploadSyncOnStart || !trainingLogUploader.hasPendingUploads()) {
+            return
+        }
+        hasPromptedPendingUploadSyncOnStart = true
+        showPendingUploadSyncPrompt(atSessionEnd = false)
+    }
+
+    private fun attemptFinishSession() {
+        if (!trainingLogUploader.hasPendingUploads()) {
+            finish()
+            return
+        }
+        showPendingUploadSyncPrompt(atSessionEnd = true)
+    }
+
+    private fun showPendingUploadSyncPrompt(atSessionEnd: Boolean) {
+        val pendingCount = trainingLogUploader.pendingUploadCount()
+        if (pendingCount <= 0) {
+            if (atSessionEnd) {
+                finish()
+            }
+            return
+        }
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (atSessionEnd) "Queued uploads before closing" else "Queued uploads saved")
+            .setMessage(buildPendingUploadPromptMessage(pendingCount, atSessionEnd))
+            .setPositiveButton("Sync now") { _, _ ->
+                trainingLogUploader.syncPendingUploads { _ ->
+                    if (atSessionEnd) {
+                        finish()
+                    }
+                }
+            }
+            .setNeutralButton("Wi-Fi settings") { _, _ ->
+                promptPendingUploadSyncOnResume = true
+                openWifiSettings()
+            }
+            .setNegativeButton(if (atSessionEnd) "End session" else "Later") { _, _ ->
+                if (atSessionEnd) {
+                    finish()
+                }
+            }
+            .show()
+        stylePendingUploadDialog(dialog)
+    }
+
+    private fun buildPendingUploadPromptMessage(pendingCount: Int, atSessionEnd: Boolean): String {
+        val itemLabel = if (pendingCount == 1) "match" else "matches"
+        val presentVerb = if (pendingCount == 1) "is" else "are"
+        val pastVerb = if (pendingCount == 1) "was" else "were"
+        val syncHint = if (trainingLogUploader.canSyncPendingUploadsNow()) {
+            "Wi-Fi is available now, so you can sync immediately."
+        } else {
+            "Connect to Wi-Fi to sync them now, or keep them saved for the next session."
+        }
+        return if (atSessionEnd) {
+            "$pendingCount queued $itemLabel $presentVerb still saved on this device. $syncHint"
+        } else {
+            "$pendingCount queued $itemLabel $pastVerb saved from an earlier session. $syncHint"
+        }
+    }
+
+    private fun openWifiSettings() {
+        startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+    }
+
     private fun maybeUploadTrainingSample(
         cropPath: String,
         result: OcrDisplayResult?,
@@ -510,7 +608,7 @@ class CameraActivity : AppCompatActivity() {
             return
         }
         lastTrainingUploadPath = normalizedPath
-        // showTopToast("Upload accepted: queued")
+        showTopToast("Upload accepted: saving")
         trainingLogUploader.maybeUpload(normalizedPath, uploadResult)
     }
 
@@ -665,6 +763,13 @@ class CameraActivity : AppCompatActivity() {
         )
     }
 
+    private fun applyGuidePanelState() {
+        binding.guideText.visibility = if (isGuideExpanded) android.view.View.VISIBLE else android.view.View.GONE
+        binding.guideToggle.setText(
+            if (isGuideExpanded) R.string.session_status_collapse else R.string.session_status_expand,
+        )
+    }
+
     private fun canUpdateUi(): Boolean {
         return !isShuttingDown.get() && !isDestroyed && !isFinishing
     }
@@ -678,6 +783,15 @@ class CameraActivity : AppCompatActivity() {
             setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 120)
             show()
         }
+    }
+
+    private fun stylePendingUploadDialog(dialog: AlertDialog) {
+        val syncColor = ContextCompat.getColor(this, R.color.dialog_button_sync)
+        val wifiColor = ContextCompat.getColor(this, R.color.dialog_button_wifi)
+        val dismissColor = ContextCompat.getColor(this, R.color.dialog_button_dismiss)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextColor(syncColor)
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setTextColor(wifiColor)
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextColor(dismissColor)
     }
 
     companion object {
