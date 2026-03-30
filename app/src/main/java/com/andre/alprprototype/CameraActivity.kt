@@ -394,7 +394,7 @@ class CameraActivity : AppCompatActivity() {
             return
         }
 
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle(if (atSessionEnd) "Queued uploads before closing" else "Queued uploads saved")
             .setMessage(buildPendingUploadPromptMessage(pendingCount, atSessionEnd))
             .setPositiveButton("Sync now") { _, _ ->
@@ -414,6 +414,7 @@ class CameraActivity : AppCompatActivity() {
                 }
             }
             .show()
+        stylePendingUploadDialog(dialog)
     }
 
     private fun buildPendingUploadPromptMessage(pendingCount: Int, atSessionEnd: Boolean): String {
@@ -617,6 +618,15 @@ class CameraActivity : AppCompatActivity() {
             setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 120)
             show()
         }
+    }
+
+    private fun stylePendingUploadDialog(dialog: AlertDialog) {
+        val syncColor = ContextCompat.getColor(this, R.color.dialog_button_sync)
+        val wifiColor = ContextCompat.getColor(this, R.color.dialog_button_wifi)
+        val dismissColor = ContextCompat.getColor(this, R.color.dialog_button_dismiss)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextColor(syncColor)
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setTextColor(wifiColor)
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextColor(dismissColor)
     }
 
     companion object {
