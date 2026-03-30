@@ -20,8 +20,6 @@ class ViolationManager(private val context: Context) {
     private val gson = Gson()
     private val queueFile = File(context.filesDir, "violation_queue.json")
     
-    // Using the same API Gateway host as RegistryManager, as the RDS endpoint in the spec
-    // is a database address and does not host the HTTP REST API.
     private val api: ViolationApi by lazy {
         val logging = HttpLoggingInterceptor { message -> Log.d("API_LOG", message) }
         logging.level = HttpLoggingInterceptor.Level.BODY
@@ -79,44 +77,46 @@ class ViolationManager(private val context: Context) {
         if (queuedViolations.isEmpty()) return@withContext Result.success(0)
 
         try {
-            // Step 1: Upload images to S3
             for (violation in queuedViolations) {
-                if (violation.s3EvidenceUri == null && violation.localImagePath != null) {
-                    val file = File(violation.localImagePath)
-                    if (!file.exists()) {
-                        Log.e(tag, "Local image not found: ${violation.localImagePath}")
-                        continue
+                // Step 1: Upload Plate Image
+                if (violation.s3PlateUri == null && violation.localPlatePath != null) {
+                    val file = File(violation.localPlatePath!!)
+                    if (file.exists()) {
+                        val uploadInfo = api.getUploadUrl(file.name)
+                        val response = api.uploadToS3(uploadInfo.uploadUrl, file.asRequestBody("image/jpeg".toMediaTypeOrNull()))
+                        if (response.isSuccessful) {
+                            violation.s3PlateUri = uploadInfo.finalS3Uri
+                            saveQueue()
+                        }
                     }
+                }
 
-                    // Get Presigned URL
-                    val uploadInfo = api.getUploadUrl(file.name)
-                    
-                    // PUT to S3
-                    val requestBody = file.asRequestBody("image/jpeg".toMediaTypeOrNull())
-                    val response = api.uploadToS3(uploadInfo.uploadUrl, requestBody)
-                    
-                    if (response.isSuccessful) {
-                        violation.s3EvidenceUri = uploadInfo.finalS3Uri
-                        saveQueue() // Persist the S3 URI in case of batch failure
-                    } else {
-                        Log.e(tag, "S3 Upload failed for ${file.name}: ${response.code()}")
-                        return@withContext Result.failure(Exception("S3 Upload failed: HTTP ${response.code()}"))
+                // Step 2: Upload Vehicle Image
+                if (violation.s3EvidenceUri == null && violation.localVehiclePath != null) {
+                    val file = File(violation.localVehiclePath!!)
+                    if (file.exists()) {
+                        val uploadInfo = api.getUploadUrl(file.name)
+                        val response = api.uploadToS3(uploadInfo.uploadUrl, file.asRequestBody("image/jpeg".toMediaTypeOrNull()))
+                        if (response.isSuccessful) {
+                            violation.s3EvidenceUri = uploadInfo.finalS3Uri
+                            saveQueue()
+                        }
                     }
                 }
             }
 
-            // Step 2: Batch Upload Metadata
-            val uploadable = queuedViolations.filter { it.s3EvidenceUri != null }
+            // Step 3: Batch Upload Metadata
+            val uploadable = queuedViolations.filter { it.s3EvidenceUri != null && it.s3PlateUri != null }
             if (uploadable.isNotEmpty()) {
                 val response = api.uploadViolations(uploadable)
                 Log.d(tag, "Batch upload success: ${response.message}")
                 
-                // Cleanup: remove uploaded violations and their local files
                 val iterator = queuedViolations.iterator()
                 while (iterator.hasNext()) {
                     val v = iterator.next()
-                    if (v.s3EvidenceUri != null) {
-                        v.localImagePath?.let { path -> File(path).delete() }
+                    if (v.s3EvidenceUri != null && v.s3PlateUri != null) {
+                        v.localPlatePath?.let { File(it).delete() }
+                        v.localVehiclePath?.let { File(it).delete() }
                         iterator.remove()
                     }
                 }

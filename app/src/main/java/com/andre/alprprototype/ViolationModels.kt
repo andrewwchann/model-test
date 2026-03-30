@@ -12,9 +12,11 @@ data class ViolationEvent(
     @SerializedName("raw_ocr_text") val rawOcrText: String,
     @SerializedName("confidence_score") val confidenceScore: Float,
     @SerializedName("timestamp") val timestamp: String, // ISO 8601 format
-    @SerializedName("s3_evidence_uri") var s3EvidenceUri: String? = null,
+    @SerializedName("s3_evidence_uri") var s3EvidenceUri: String? = null, // Vehicle Photo S3
+    @SerializedName("s3_plate_uri") var s3PlateUri: String? = null,       // Plate Photo S3
     @SerializedName("operator_id") val operatorId: String,
-    @Transient val localImagePath: String? = null // Used locally before upload
+    @Transient var localVehiclePath: String? = null,
+    @Transient var localPlatePath: String? = null
 )
 
 data class BatchUploadResponse(
