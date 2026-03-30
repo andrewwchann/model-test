@@ -273,8 +273,6 @@ class PlateOcrEngine(context: Context) {
         if (bottom <= top) return null
         return Bitmap.createBitmap(source, 0, top, source.width, bottom - top)
     }
-
-    private fun format(value: Float): String = String.format(java.util.Locale.US, "%.3f", value)
 }
 
 private data class PreparedInput(
@@ -351,5 +349,3 @@ private fun copyAssetToCache(context: Context, assetPath: String): File {
     }
     return outFile
 }
-
-private fun nanosToMillis(durationNs: Long): Long = durationNs / 1_000_000L
