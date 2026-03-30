@@ -42,7 +42,7 @@ android {
         buildConfigField(
             "boolean",
             "TRAINING_LOGGER_WIFI_ONLY",
-            booleanProperty("trainingLoggingEnabled", false).toString(),
+            booleanProperty("trainingLoggerWifiOnly", false).toString(),
         )
         buildConfigField(
             "double",
