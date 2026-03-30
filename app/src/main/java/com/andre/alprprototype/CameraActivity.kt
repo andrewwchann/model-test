@@ -16,6 +16,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -27,9 +29,14 @@ import com.andre.alprprototype.alpr.AlprPipeline
 import com.andre.alprprototype.alpr.BestPlateCropSaver
 import com.andre.alprprototype.alpr.YoloTflitePlateCandidateGenerator
 import com.andre.alprprototype.databinding.ActivityCameraBinding
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.launch
 import java.util.ArrayDeque
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -54,8 +61,10 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var pipeline: AlprPipeline
     private lateinit var trainingLogUploader: TrainingLogUploader
     private lateinit var registryManager: RegistryManager
+    private lateinit var violationManager: ViolationManager
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
+    private var imageCapture: ImageCapture? = null
     private var latestFrame: AnalyzedFrame? = null
     private var lastSavedCropPath: String? = null
     private var lastOcrRequestedPath: String? = null
@@ -69,9 +78,11 @@ class CameraActivity : AppCompatActivity() {
     private val currentTrackOcrVotes = ArrayDeque<String>()
     private lateinit var plateOcrEngine: PlateOcrEngine
     private var isStatusExpanded: Boolean = false
+    private var isGuideExpanded: Boolean = false
     private var hasPromptedPendingUploadSyncOnStart: Boolean = false
     private var promptPendingUploadSyncOnResume: Boolean = false
     private val isShuttingDown = AtomicBoolean(false)
+    private var isProcessingViolation = false
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -94,6 +105,7 @@ class CameraActivity : AppCompatActivity() {
         pipeline = AlprPipeline.create(this)
         plateOcrEngine = PlateOcrEngine(this)
         registryManager = RegistryManager(this)
+        violationManager = ViolationManager(this)
         trainingLogUploader = TrainingLogUploader(this) { message ->
             if (canUpdateUi()) {
                 showTopToast(message)
@@ -102,11 +114,17 @@ class CameraActivity : AppCompatActivity() {
         binding.sessionStatus.text = "Detector loaded: ${pipeline.detectorName}\n$detectorSelfTestSummary\nOpening camera stream and ALPR debug pipeline..."
         runDetectorSelfTest()
         applyStatusPanelState()
+        applyGuidePanelState()
+        updateUploadButtonText()
 
         binding.closeButton.setOnClickListener { attemptFinishSession() }
         binding.sessionStatusHeader.setOnClickListener {
             isStatusExpanded = !isStatusExpanded
             applyStatusPanelState()
+        }
+        binding.guideHeader.setOnClickListener {
+            isGuideExpanded = !isGuideExpanded
+            applyGuidePanelState()
         }
         onBackPressedDispatcher.addCallback(
             this,
@@ -119,6 +137,10 @@ class CameraActivity : AppCompatActivity() {
 
         binding.syncButton.setOnClickListener {
             syncRegistry()
+        }
+
+        binding.uploadQueueButton.setOnClickListener {
+            uploadQueue()
         }
 
         if (hasCameraPermission()) {
@@ -152,6 +174,29 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
+    private fun uploadQueue() {
+        if (violationManager.getQueueSize() == 0) {
+            Toast.makeText(this, "Queue is empty", Toast.LENGTH_SHORT).show()
+            return
+        }
+        binding.uploadQueueButton.isEnabled = false
+        binding.uploadQueueButton.text = "Uploading..."
+        lifecycleScope.launch {
+            val result = violationManager.uploadQueue()
+            if (result.isSuccess) {
+                Toast.makeText(this@CameraActivity, "Uploaded ${result.getOrNull()} violations", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this@CameraActivity, "Upload failed: ${result.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+            }
+            updateUploadButtonText()
+            binding.uploadQueueButton.isEnabled = true
+        }
+    }
+
+    private fun updateUploadButtonText() {
+        binding.uploadQueueButton.text = "Upload (${violationManager.getQueueSize()})"
+    }
+
     private fun hasCameraPermission(): Boolean {
         return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
@@ -175,6 +220,10 @@ class CameraActivity : AppCompatActivity() {
                 val preview = Preview.Builder()
                     .build()
                     .also { it.setSurfaceProvider(binding.previewView.surfaceProvider) }
+
+                imageCapture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .build()
 
                 val analysisResolutionSelector = ResolutionSelector.Builder()
                     .setResolutionStrategy(
@@ -221,7 +270,7 @@ class CameraActivity : AppCompatActivity() {
 
                 cameraProvider.unbindAll()
                 if (canUseCamera()) {
-                    cameraProvider.bindToLifecycle(this, cameraSelector, preview, analysis)
+                    cameraProvider.bindToLifecycle(this, cameraSelector, preview, analysis, imageCapture)
                 }
             } catch (_: Throwable) {
                 // Activity may already be finishing/destroyed when camera provider resolves.
@@ -298,7 +347,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun requestOcrIfNeeded(cropPath: String, frameState: com.andre.alprprototype.alpr.PipelineDebugState) {
-        if (cropPath == lastOcrRequestedPath) {
+        if (cropPath == lastOcrRequestedPath || isProcessingViolation) {
             return
         }
         lastOcrRequestedPath = cropPath
@@ -307,7 +356,7 @@ class CameraActivity : AppCompatActivity() {
         updateCropCaption()
         plateOcrEngine.recognize(cropPath) { result ->
             runOnUiThread {
-                if (!canUpdateUi() || cropPath != lastOcrRequestedPath) {
+                if (!canUpdateUi() || cropPath != lastOcrRequestedPath || isProcessingViolation) {
                     return@runOnUiThread
                 }
                 latestOcrResult = result
@@ -323,6 +372,9 @@ class CameraActivity : AppCompatActivity() {
                     result?.text?.let { text ->
                         val validation = registryManager.isPlateValid(text)
                         updateValidationUi(validation)
+                        if (validation == RegistryManager.PlateValidationResult.NOT_FOUND || validation == RegistryManager.PlateValidationResult.EXPIRED) {
+                            promptForViolationCollection(text, result.confidence ?: 0f, cropPath)
+                        }
                     }
                     maybeUploadTrainingSample(cropPath, result, frameState)
                 } else {
@@ -333,6 +385,112 @@ class CameraActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun promptForViolationCollection(plateText: String, confidence: Float, cropPath: String) {
+        isProcessingViolation = true
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Violation Found")
+            .setMessage("Plate: $plateText\nDo you want to collect evidence for this violation?")
+            .setPositiveButton("Yes") { _, _ ->
+                promptToCaptureVehiclePhoto(plateText, confidence, cropPath)
+            }
+            .setNegativeButton("No") { _, _ ->
+                isProcessingViolation = false
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun promptToCaptureVehiclePhoto(plateText: String, confidence: Float, cropPath: String) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Evidence Collection")
+            .setMessage("Please point the camera at the vehicle and press 'Capture'.")
+            .setPositiveButton("Capture") { _, _ ->
+                takeVehiclePhoto { vehiclePhotoPath ->
+                    confirmVehiclePhoto(plateText, confidence, cropPath, vehiclePhotoPath)
+                }
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                isProcessingViolation = false
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun takeVehiclePhoto(onCaptured: (String) -> Unit) {
+        val capture = imageCapture ?: run {
+            Toast.makeText(this, "Camera not ready", Toast.LENGTH_SHORT).show()
+            isProcessingViolation = false
+            return
+        }
+
+        val photoFile = File(
+            cacheDir,
+            "vehicle_${System.currentTimeMillis()}.jpg"
+        )
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(
+            outputOptions,
+            cameraExecutor,
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                    runOnUiThread {
+                        onCaptured(photoFile.absolutePath)
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    runOnUiThread {
+                        Toast.makeText(this@CameraActivity, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
+                        isProcessingViolation = false
+                    }
+                }
+            }
+        )
+    }
+
+    private fun confirmVehiclePhoto(plateText: String, confidence: Float, cropPath: String, vehiclePhotoPath: String) {
+        // Show the captured photo in a dialog for confirmation
+        val imageView = android.widget.ImageView(this).apply {
+            setImageBitmap(BitmapFactory.decodeFile(vehiclePhotoPath))
+            adjustViewBounds = true
+            setPadding(20, 20, 20, 20)
+        }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Confirm Vehicle Photo")
+            .setView(imageView)
+            .setPositiveButton("Good") { _, _ ->
+                queueViolation(plateText, confidence, cropPath, vehiclePhotoPath)
+                isProcessingViolation = false
+            }
+            .setNegativeButton("Retake") { _, _ ->
+                File(vehiclePhotoPath).delete()
+                promptToCaptureVehiclePhoto(plateText, confidence, cropPath)
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun queueViolation(plateText: String, confidence: Float, cropPath: String, vehiclePath: String) {
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
+        val timestamp = sdf.format(Date())
+
+        val violation = ViolationEvent(
+            rawOcrText = plateText,
+            confidenceScore = confidence,
+            timestamp = timestamp,
+            operatorId = "Device_01", // Placeholder
+            localPlatePath = cropPath,
+            localVehiclePath = vehiclePath
+        )
+        violationManager.addViolation(violation)
+        updateUploadButtonText()
+        showTopToast("Violation queued: $plateText")
     }
 
     private fun updateValidationUi(result: RegistryManager.PlateValidationResult) {
@@ -446,7 +604,7 @@ class CameraActivity : AppCompatActivity() {
         val normalizedPath = File(cropPath).absolutePath
         val decision = evaluateTrainingUpload(frameState, normalizedPath, uploadResult)
         if (!decision.allowed) {
-            showTopToast("Upload skipped: ${decision.reason}")
+            // showTopToast("Upload skipped: ${decision.reason}")
             return
         }
         lastTrainingUploadPath = normalizedPath
@@ -602,6 +760,13 @@ class CameraActivity : AppCompatActivity() {
         binding.sessionStatus.visibility = if (isStatusExpanded) android.view.View.VISIBLE else android.view.View.GONE
         binding.sessionStatusToggle.setText(
             if (isStatusExpanded) R.string.session_status_collapse else R.string.session_status_expand,
+        )
+    }
+
+    private fun applyGuidePanelState() {
+        binding.guideText.visibility = if (isGuideExpanded) android.view.View.VISIBLE else android.view.View.GONE
+        binding.guideToggle.setText(
+            if (isGuideExpanded) R.string.session_status_collapse else R.string.session_status_expand,
         )
     }
 
