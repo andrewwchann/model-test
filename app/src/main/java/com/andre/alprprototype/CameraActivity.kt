@@ -353,7 +353,6 @@ class CameraActivity : AppCompatActivity() {
         val uploadResult = result ?: return
         val normalizedPath = File(cropPath).absolutePath
         val decision = evaluateTrainingUpload(frameState, normalizedPath, uploadResult)
-        logUploadDecision(normalizedPath, uploadResult, frameState, decision)
         if (!decision.allowed) {
             showTopToast("Upload skipped: ${decision.reason}")
             return
@@ -505,16 +504,6 @@ class CameraActivity : AppCompatActivity() {
         }
         val margin = result.scoreMargin ?: return true
         return margin < MIN_OCR_SCORE_MARGIN
-    }
-
-    private fun logUploadDecision(
-        cropPath: String,
-        ocrResult: OcrDisplayResult,
-        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
-        decision: UploadDecision,
-    ) {
-        // Intentionally left blank. Keep the helper so upload-decision tracing
-        // can be restored quickly during debugging without touching call sites.
     }
 
     private fun applyStatusPanelState() {
