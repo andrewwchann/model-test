@@ -12,6 +12,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -23,6 +25,7 @@ import com.andre.alprprototype.alpr.AlprPipeline
 import com.andre.alprprototype.alpr.BestPlateCropSaver
 import com.andre.alprprototype.alpr.YoloTflitePlateCandidateGenerator
 import com.andre.alprprototype.databinding.ActivityCameraBinding
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.launch
 import java.util.ArrayDeque
 import java.io.File
@@ -57,6 +60,7 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var violationManager: ViolationManager
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
+    private var imageCapture: ImageCapture? = null
     private var latestFrame: AnalyzedFrame? = null
     private var lastSavedCropPath: String? = null
     private var lastOcrRequestedPath: String? = null
@@ -71,6 +75,7 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var plateOcrEngine: PlateOcrEngine
     private var isStatusExpanded: Boolean = false
     private val isShuttingDown = AtomicBoolean(false)
+    private var isProcessingViolation = false
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -186,6 +191,10 @@ class CameraActivity : AppCompatActivity() {
                     .build()
                     .also { it.setSurfaceProvider(binding.previewView.surfaceProvider) }
 
+                imageCapture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .build()
+
                 val analysisResolutionSelector = ResolutionSelector.Builder()
                     .setResolutionStrategy(
                         ResolutionStrategy(
@@ -231,7 +240,7 @@ class CameraActivity : AppCompatActivity() {
 
                 cameraProvider.unbindAll()
                 if (canUseCamera()) {
-                    cameraProvider.bindToLifecycle(this, cameraSelector, preview, analysis)
+                    cameraProvider.bindToLifecycle(this, cameraSelector, preview, analysis, imageCapture)
                 }
             } catch (_: Throwable) {
                 // Activity may already be finishing/destroyed when camera provider resolves.
@@ -308,7 +317,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun requestOcrIfNeeded(cropPath: String, frameState: com.andre.alprprototype.alpr.PipelineDebugState) {
-        if (cropPath == lastOcrRequestedPath) {
+        if (cropPath == lastOcrRequestedPath || isProcessingViolation) {
             return
         }
         lastOcrRequestedPath = cropPath
@@ -317,7 +326,7 @@ class CameraActivity : AppCompatActivity() {
         updateCropCaption()
         plateOcrEngine.recognize(cropPath) { result ->
             runOnUiThread {
-                if (!canUpdateUi() || cropPath != lastOcrRequestedPath) {
+                if (!canUpdateUi() || cropPath != lastOcrRequestedPath || isProcessingViolation) {
                     return@runOnUiThread
                 }
                 latestOcrResult = result
@@ -334,7 +343,7 @@ class CameraActivity : AppCompatActivity() {
                         val validation = registryManager.isPlateValid(text)
                         updateValidationUi(validation)
                         if (validation == RegistryManager.PlateValidationResult.NOT_FOUND || validation == RegistryManager.PlateValidationResult.EXPIRED) {
-                            queueViolation(text, result.confidence ?: 0f, cropPath)
+                            promptForViolationCollection(text, result.confidence ?: 0f, cropPath)
                         }
                     }
                     maybeUploadTrainingSample(cropPath, result, frameState)
@@ -348,7 +357,95 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
-    private fun queueViolation(plateText: String, confidence: Float, cropPath: String) {
+    private fun promptForViolationCollection(plateText: String, confidence: Float, cropPath: String) {
+        isProcessingViolation = true
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Violation Found")
+            .setMessage("Plate: $plateText\nDo you want to collect evidence for this violation?")
+            .setPositiveButton("Yes") { _, _ ->
+                promptToCaptureVehiclePhoto(plateText, confidence, cropPath)
+            }
+            .setNegativeButton("No") { _, _ ->
+                isProcessingViolation = false
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun promptToCaptureVehiclePhoto(plateText: String, confidence: Float, cropPath: String) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Evidence Collection")
+            .setMessage("Please point the camera at the vehicle and press 'Capture'.")
+            .setPositiveButton("Capture") { _, _ ->
+                takeVehiclePhoto { vehiclePhotoPath ->
+                    confirmVehiclePhoto(plateText, confidence, cropPath, vehiclePhotoPath)
+                }
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                isProcessingViolation = false
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun takeVehiclePhoto(onCaptured: (String) -> Unit) {
+        val capture = imageCapture ?: run {
+            Toast.makeText(this, "Camera not ready", Toast.LENGTH_SHORT).show()
+            isProcessingViolation = false
+            return
+        }
+
+        val photoFile = File(
+            cacheDir,
+            "vehicle_${System.currentTimeMillis()}.jpg"
+        )
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(
+            outputOptions,
+            cameraExecutor,
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                    runOnUiThread {
+                        onCaptured(photoFile.absolutePath)
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    runOnUiThread {
+                        Toast.makeText(this@CameraActivity, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
+                        isProcessingViolation = false
+                    }
+                }
+            }
+        )
+    }
+
+    private fun confirmVehiclePhoto(plateText: String, confidence: Float, cropPath: String, vehiclePhotoPath: String) {
+        // Show the captured photo in a dialog for confirmation
+        val imageView = android.widget.ImageView(this).apply {
+            setImageBitmap(BitmapFactory.decodeFile(vehiclePhotoPath))
+            adjustViewBounds = true
+            setPadding(20, 20, 20, 20)
+        }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Confirm Vehicle Photo")
+            .setView(imageView)
+            .setPositiveButton("Good") { _, _ ->
+                queueViolation(plateText, confidence, cropPath, vehiclePhotoPath)
+                isProcessingViolation = false
+            }
+            .setNegativeButton("Retake") { _, _ ->
+                File(vehiclePhotoPath).delete()
+                promptToCaptureVehiclePhoto(plateText, confidence, cropPath)
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun queueViolation(plateText: String, confidence: Float, cropPath: String, vehiclePath: String) {
         val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
         sdf.timeZone = TimeZone.getTimeZone("UTC")
         val timestamp = sdf.format(Date())
@@ -358,7 +455,8 @@ class CameraActivity : AppCompatActivity() {
             confidenceScore = confidence,
             timestamp = timestamp,
             operatorId = "Device_01", // Placeholder
-            localImagePath = cropPath
+            localPlatePath = cropPath,
+            localVehiclePath = vehiclePath
         )
         violationManager.addViolation(violation)
         updateUploadButtonText()
