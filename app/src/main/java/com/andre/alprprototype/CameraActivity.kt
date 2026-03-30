@@ -26,6 +26,10 @@ import com.andre.alprprototype.databinding.ActivityCameraBinding
 import kotlinx.coroutines.launch
 import java.util.ArrayDeque
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -50,6 +54,7 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var pipeline: AlprPipeline
     private lateinit var trainingLogUploader: TrainingLogUploader
     private lateinit var registryManager: RegistryManager
+    private lateinit var violationManager: ViolationManager
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
     private var latestFrame: AnalyzedFrame? = null
@@ -87,6 +92,7 @@ class CameraActivity : AppCompatActivity() {
         pipeline = AlprPipeline.create(this)
         plateOcrEngine = PlateOcrEngine(this)
         registryManager = RegistryManager(this)
+        violationManager = ViolationManager(this)
         trainingLogUploader = TrainingLogUploader(this) { message ->
             if (canUpdateUi()) {
                 showTopToast(message)
@@ -95,6 +101,7 @@ class CameraActivity : AppCompatActivity() {
         binding.sessionStatus.text = "Detector loaded: ${pipeline.detectorName}\n$detectorSelfTestSummary\nOpening camera stream and ALPR debug pipeline..."
         runDetectorSelfTest()
         applyStatusPanelState()
+        updateUploadButtonText()
 
         binding.closeButton.setOnClickListener { finish() }
         binding.sessionStatusHeader.setOnClickListener {
@@ -104,6 +111,10 @@ class CameraActivity : AppCompatActivity() {
 
         binding.syncButton.setOnClickListener {
             syncRegistry()
+        }
+
+        binding.uploadQueueButton.setOnClickListener {
+            uploadQueue()
         }
 
         if (hasCameraPermission()) {
@@ -126,6 +137,29 @@ class CameraActivity : AppCompatActivity() {
             binding.syncButton.isEnabled = true
             binding.syncButton.text = "Sync Registry"
         }
+    }
+
+    private fun uploadQueue() {
+        if (violationManager.getQueueSize() == 0) {
+            Toast.makeText(this, "Queue is empty", Toast.LENGTH_SHORT).show()
+            return
+        }
+        binding.uploadQueueButton.isEnabled = false
+        binding.uploadQueueButton.text = "Uploading..."
+        lifecycleScope.launch {
+            val result = violationManager.uploadQueue()
+            if (result.isSuccess) {
+                Toast.makeText(this@CameraActivity, "Uploaded ${result.getOrNull()} violations", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this@CameraActivity, "Upload failed: ${result.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+            }
+            updateUploadButtonText()
+            binding.uploadQueueButton.isEnabled = true
+        }
+    }
+
+    private fun updateUploadButtonText() {
+        binding.uploadQueueButton.text = "Upload (${violationManager.getQueueSize()})"
     }
 
     private fun hasCameraPermission(): Boolean {
@@ -299,6 +333,9 @@ class CameraActivity : AppCompatActivity() {
                     result?.text?.let { text ->
                         val validation = registryManager.isPlateValid(text)
                         updateValidationUi(validation)
+                        if (validation == RegistryManager.PlateValidationResult.NOT_FOUND || validation == RegistryManager.PlateValidationResult.EXPIRED) {
+                            queueViolation(text, result.confidence ?: 0f, cropPath)
+                        }
                     }
                     maybeUploadTrainingSample(cropPath, result, frameState)
                 } else {
@@ -309,6 +346,23 @@ class CameraActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun queueViolation(plateText: String, confidence: Float, cropPath: String) {
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
+        val timestamp = sdf.format(Date())
+
+        val violation = ViolationEvent(
+            rawOcrText = plateText,
+            confidenceScore = confidence,
+            timestamp = timestamp,
+            operatorId = "Device_01", // Placeholder
+            localImagePath = cropPath
+        )
+        violationManager.addViolation(violation)
+        updateUploadButtonText()
+        showTopToast("Violation queued: $plateText")
     }
 
     private fun updateValidationUi(result: RegistryManager.PlateValidationResult) {
@@ -354,11 +408,11 @@ class CameraActivity : AppCompatActivity() {
         val normalizedPath = File(cropPath).absolutePath
         val decision = evaluateTrainingUpload(frameState, normalizedPath, uploadResult)
         if (!decision.allowed) {
-            showTopToast("Upload skipped: ${decision.reason}")
+            // showTopToast("Upload skipped: ${decision.reason}")
             return
         }
         lastTrainingUploadPath = normalizedPath
-        showTopToast("Upload accepted: queued")
+        // showTopToast("Upload accepted: queued")
         trainingLogUploader.maybeUpload(normalizedPath, uploadResult)
     }
 

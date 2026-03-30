@@ -54,6 +54,16 @@
         app:layout_constraintStart_toEndOf="@id/sessionLabel"
         app:layout_constraintTop_toTopOf="@id/sessionLabel" />
 
+    <Button
+        android:id="@+id/uploadQueueButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:text="Upload (0)"
+        app:layout_constraintBottom_toBottomOf="@id/syncButton"
+        app:layout_constraintStart_toEndOf="@id/syncButton"
+        app:layout_constraintTop_toTopOf="@id/syncButton" />
+
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/cropPreviewCard"
         android:layout_width="140dp"
