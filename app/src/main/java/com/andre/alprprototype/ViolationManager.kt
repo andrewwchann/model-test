@@ -14,11 +14,14 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.io.File
 import java.util.concurrent.TimeUnit
+import java.util.UUID
 
 class ViolationManager(private val context: Context) {
     private val tag = "ViolationManager"
     private val gson = Gson()
     private val queueFile = File(context.filesDir, "violation_queue.json")
+    private val stagedImageDir = File(context.filesDir, "queued-violation-images").apply { mkdirs() }
+    private val queueLock = Any()
     
     private val api: ViolationApi by lazy {
         val logging = HttpLoggingInterceptor { message -> Log.d("API_LOG", message) }
@@ -49,7 +52,9 @@ class ViolationManager(private val context: Context) {
             try {
                 val json = queueFile.readText()
                 val type = object : TypeToken<MutableList<ViolationEvent>>() {}.type
-                queuedViolations = gson.fromJson(json, type) ?: mutableListOf()
+                synchronized(queueLock) {
+                    queuedViolations = gson.fromJson(json, type) ?: mutableListOf()
+                }
                 Log.d(tag, "Loaded ${queuedViolations.size} violations from queue")
             } catch (e: Exception) {
                 Log.e(tag, "Failed to load queue", e)
@@ -59,7 +64,9 @@ class ViolationManager(private val context: Context) {
 
     private fun saveQueue() {
         try {
-            val json = gson.toJson(queuedViolations)
+            val json = synchronized(queueLock) {
+                gson.toJson(queuedViolations)
+            }
             queueFile.writeText(json)
         } catch (e: Exception) {
             Log.e(tag, "Failed to save queue", e)
@@ -67,17 +74,21 @@ class ViolationManager(private val context: Context) {
     }
 
     fun addViolation(violation: ViolationEvent) {
-        queuedViolations.add(violation)
+        val stagedViolation = stageViolationAssets(violation) ?: return
+        synchronized(queueLock) {
+            queuedViolations.add(stagedViolation)
+        }
         saveQueue()
     }
 
-    fun getQueueSize(): Int = queuedViolations.size
+    fun getQueueSize(): Int = synchronized(queueLock) { queuedViolations.size }
 
     suspend fun uploadQueue(): Result<Int> = withContext(Dispatchers.IO) {
-        if (queuedViolations.isEmpty()) return@withContext Result.success(0)
+        val queueSnapshot = synchronized(queueLock) { queuedViolations.toList() }
+        if (queueSnapshot.isEmpty()) return@withContext Result.success(0)
 
         try {
-            for (violation in queuedViolations) {
+            for (violation in queueSnapshot) {
                 // Step 1: Upload Plate Image
                 if (violation.s3PlateUri == null && violation.localPlatePath != null) {
                     val file = File(violation.localPlatePath!!)
@@ -87,7 +98,11 @@ class ViolationManager(private val context: Context) {
                         if (response.isSuccessful) {
                             violation.s3PlateUri = uploadInfo.finalS3Uri
                             saveQueue()
+                        } else {
+                            Log.w(tag, "Plate upload failed for ${file.name} code=${response.code()}")
                         }
+                    } else {
+                        Log.w(tag, "Missing queued plate image path=${violation.localPlatePath}")
                     }
                 }
 
@@ -100,25 +115,38 @@ class ViolationManager(private val context: Context) {
                         if (response.isSuccessful) {
                             violation.s3EvidenceUri = uploadInfo.finalS3Uri
                             saveQueue()
+                        } else {
+                            Log.w(tag, "Vehicle upload failed for ${file.name} code=${response.code()}")
                         }
+                    } else {
+                        Log.w(tag, "Missing queued vehicle image path=${violation.localVehiclePath}")
                     }
                 }
             }
 
             // Step 3: Batch Upload Metadata
-            val uploadable = queuedViolations.filter { it.s3EvidenceUri != null && it.s3PlateUri != null }
+            val uploadable = synchronized(queueLock) {
+                queuedViolations.filter { it.s3EvidenceUri != null && it.s3PlateUri != null }
+            }
             if (uploadable.isNotEmpty()) {
                 val response = api.uploadViolations(uploadable)
                 Log.d(tag, "Batch upload success: ${response.message}")
-                
-                val iterator = queuedViolations.iterator()
-                while (iterator.hasNext()) {
-                    val v = iterator.next()
-                    if (v.s3EvidenceUri != null && v.s3PlateUri != null) {
-                        v.localPlatePath?.let { File(it).delete() }
-                        v.localVehiclePath?.let { File(it).delete() }
-                        iterator.remove()
+
+                val uploadedKeys = uploadable.map { it.queueKey() }.toSet()
+                val uploadedEntries = mutableListOf<ViolationEvent>()
+                synchronized(queueLock) {
+                    val iterator = queuedViolations.iterator()
+                    while (iterator.hasNext()) {
+                        val queued = iterator.next()
+                        if (queued.queueKey() in uploadedKeys) {
+                            uploadedEntries += queued
+                            iterator.remove()
+                        }
                     }
+                }
+                uploadedEntries.forEach { event ->
+                    event.localPlatePath?.let { File(it).delete() }
+                    event.localVehiclePath?.let { File(it).delete() }
                 }
                 saveQueue()
                 Result.success(uploadable.size)
@@ -129,5 +157,44 @@ class ViolationManager(private val context: Context) {
             Log.e(tag, "Queue upload failed", e)
             Result.failure(e)
         }
+    }
+
+    private fun stageViolationAssets(violation: ViolationEvent): ViolationEvent? {
+        val stagedPlatePath = stageFile(violation.localPlatePath, "plate") ?: return null
+        val stagedVehiclePath = stageFile(violation.localVehiclePath, "vehicle") ?: return null
+        return violation.copy(
+            localPlatePath = stagedPlatePath,
+            localVehiclePath = stagedVehiclePath,
+        )
+    }
+
+    private fun stageFile(sourcePath: String?, prefix: String): String? {
+        val normalizedSourcePath = sourcePath ?: return null
+        val sourceFile = File(normalizedSourcePath)
+        if (!sourceFile.exists() || !sourceFile.isFile) {
+            Log.w(tag, "Cannot queue missing file path=$normalizedSourcePath")
+            return null
+        }
+        if (sourceFile.parentFile?.absolutePath == stagedImageDir.absolutePath) {
+            return sourceFile.absolutePath
+        }
+
+        val stagedFile = File(stagedImageDir, "${prefix}_${UUID.randomUUID()}_${sourceFile.name}")
+        return try {
+            sourceFile.copyTo(stagedFile, overwrite = false)
+            stagedFile.absolutePath
+        } catch (e: Exception) {
+            Log.e(tag, "Failed staging queued file path=$normalizedSourcePath", e)
+            null
+        }
+    }
+
+    private fun ViolationEvent.queueKey(): String {
+        return listOf(
+            rawOcrText,
+            timestamp,
+            localPlatePath.orEmpty(),
+            localVehiclePath.orEmpty(),
+        ).joinToString("|")
     }
 }

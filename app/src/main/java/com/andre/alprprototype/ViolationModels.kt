@@ -15,8 +15,8 @@ data class ViolationEvent(
     @SerializedName("s3_evidence_uri") var s3EvidenceUri: String? = null, // Vehicle Photo S3
     @SerializedName("s3_plate_uri") var s3PlateUri: String? = null,       // Plate Photo S3
     @SerializedName("operator_id") val operatorId: String,
-    @Transient var localVehiclePath: String? = null,
-    @Transient var localPlatePath: String? = null
+    @SerializedName("local_vehicle_path") var localVehiclePath: String? = null,
+    @SerializedName("local_plate_path") var localPlatePath: String? = null,
 )
 
 data class BatchUploadResponse(
