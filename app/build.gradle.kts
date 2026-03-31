@@ -26,31 +26,6 @@ android {
 
         buildConfigField(
             "boolean",
-            "TRAINING_LOGGING_ENABLED",
-            booleanProperty("trainingLoggingEnabled", false).toString(),
-        )
-        buildConfigField(
-            "String",
-            "TRAINING_LOGGER_ENDPOINT",
-            "\"${stringProperty("trainingLoggerEndpoint").replace("\"", "\\\"")}\"",
-        )
-        buildConfigField(
-            "String",
-            "TRAINING_LOGGER_SECRET",
-            "\"${stringProperty("trainingLoggerSecret").replace("\"", "\\\"")}\"",
-        )
-        buildConfigField(
-            "boolean",
-            "TRAINING_LOGGER_WIFI_ONLY",
-            booleanProperty("trainingLoggerWifiOnly", false).toString(),
-        )
-        buildConfigField(
-            "double",
-            "TRAINING_LOGGER_MIN_CONFIDENCE",
-            stringProperty("trainingLoggerMinConfidence", "0.75"),
-        )
-        buildConfigField(
-            "boolean",
             "ALPR_PERF_LOGS_ENABLED",
             booleanProperty("alprPerfLogsEnabled", false).toString(),
         )

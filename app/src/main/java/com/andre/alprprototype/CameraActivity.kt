@@ -31,7 +31,6 @@ import com.andre.alprprototype.alpr.YoloTflitePlateCandidateGenerator
 import com.andre.alprprototype.databinding.ActivityCameraBinding
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.launch
-import java.util.ArrayDeque
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -43,11 +42,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class CameraActivity : AppCompatActivity() {
-    private data class UploadDecision(
-        val allowed: Boolean,
-        val reason: String,
-    )
-
     private enum class OcrUiState {
         IDLE,
         PENDING,
@@ -59,7 +53,6 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var cropSaver: BestPlateCropSaver
     private lateinit var pipeline: AlprPipeline
-    private lateinit var trainingLogUploader: TrainingLogUploader
     private lateinit var registryManager: RegistryManager
     private lateinit var violationManager: ViolationManager
     private var cameraProvider: ProcessCameraProvider? = null
@@ -68,14 +61,11 @@ class CameraActivity : AppCompatActivity() {
     private var latestFrame: AnalyzedFrame? = null
     private var lastSavedCropPath: String? = null
     private var lastOcrRequestedPath: String? = null
-    private var lastTrainingUploadPath: String? = null
     private var latestOcrResult: OcrDisplayResult? = null
     private var latestOcrState: OcrUiState = OcrUiState.IDLE
     private var detectorSelfTestSummary: String = "Self-test: pending"
     private var lastConfirmedPlateText: String? = null
     private var lastConfirmedPlateAtMs: Long = 0L
-    private var currentOcrVoteTrackId: Int? = null
-    private val currentTrackOcrVotes = ArrayDeque<String>()
     private lateinit var plateOcrEngine: PlateOcrEngine
     private var isStatusExpanded: Boolean = false
     private var isGuideExpanded: Boolean = false
@@ -106,11 +96,6 @@ class CameraActivity : AppCompatActivity() {
         plateOcrEngine = PlateOcrEngine(this)
         registryManager = RegistryManager(this)
         violationManager = ViolationManager(this)
-        trainingLogUploader = TrainingLogUploader(this) { message ->
-            if (canUpdateUi()) {
-                showTopToast(message)
-            }
-        }
         binding.sessionStatus.text = "Detector loaded: ${pipeline.detectorName}\n$detectorSelfTestSummary\nOpening camera stream and ALPR debug pipeline..."
         runDetectorSelfTest()
         applyStatusPanelState()
@@ -257,7 +242,7 @@ class CameraActivity : AppCompatActivity() {
                                     if (frame.savedCropPath != null) {
                                         lastSavedCropPath = frame.savedCropPath
                                         updateCropPreview(frame.savedCropPath)
-                                        requestOcrIfNeeded(frame.savedCropPath, frame.state)
+                                        requestOcrIfNeeded(frame.savedCropPath)
                                     }
                                     binding.sessionStatus.text = buildStatusText(frame)
                                     binding.debugOverlay.render(frame.state)
@@ -290,7 +275,6 @@ class CameraActivity : AppCompatActivity() {
         }
         pipeline.close()
         plateOcrEngine.close()
-        trainingLogUploader.close()
         super.onDestroy()
     }
 
@@ -346,7 +330,7 @@ class CameraActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestOcrIfNeeded(cropPath: String, frameState: com.andre.alprprototype.alpr.PipelineDebugState) {
+    private fun requestOcrIfNeeded(cropPath: String) {
         if (cropPath == lastOcrRequestedPath || isProcessingViolation) {
             return
         }
@@ -362,7 +346,6 @@ class CameraActivity : AppCompatActivity() {
                 latestOcrResult = result
                 latestOcrState = if (result?.text.isNullOrBlank()) OcrUiState.UNAVAILABLE else OcrUiState.READY
                 updateCropCaption()
-                recordTrackOcrVote(frameState, result)
 
                 val allowConfirmedActions = result?.text?.let { text ->
                     shouldProcessConfirmedPlate(text)
@@ -376,7 +359,6 @@ class CameraActivity : AppCompatActivity() {
                             promptForViolationCollection(text, result.confidence ?: 0f, cropPath)
                         }
                     }
-                    maybeUploadTrainingSample(cropPath, result, frameState)
                 } else {
                     binding.validationIndicator.visibility = android.view.View.GONE
                 }
@@ -528,7 +510,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun maybePromptToSyncPendingUploadsOnStart() {
-        if (hasPromptedPendingUploadSyncOnStart || !trainingLogUploader.hasPendingUploads()) {
+        if (hasPromptedPendingUploadSyncOnStart || violationManager.getQueueSize() <= 0) {
             return
         }
         hasPromptedPendingUploadSyncOnStart = true
@@ -536,7 +518,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun attemptFinishSession() {
-        if (!trainingLogUploader.hasPendingUploads()) {
+        if (violationManager.getQueueSize() <= 0) {
             finish()
             return
         }
@@ -544,7 +526,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun showPendingUploadSyncPrompt(atSessionEnd: Boolean) {
-        val pendingCount = trainingLogUploader.pendingUploadCount()
+        val pendingCount = violationManager.getQueueSize()
         if (pendingCount <= 0) {
             if (atSessionEnd) {
                 finish()
@@ -556,7 +538,14 @@ class CameraActivity : AppCompatActivity() {
             .setTitle(if (atSessionEnd) "Queued uploads before closing" else "Queued uploads saved")
             .setMessage(buildPendingUploadPromptMessage(pendingCount, atSessionEnd))
             .setPositiveButton("Sync now") { _, _ ->
-                trainingLogUploader.syncPendingUploads { _ ->
+                lifecycleScope.launch {
+                    val result = violationManager.uploadQueue()
+                    updateUploadButtonText()
+                    if (result.isSuccess) {
+                        showTopToast("Uploaded ${result.getOrNull() ?: 0} queued item(s)")
+                    } else {
+                        showTopToast("Queued uploads not synced")
+                    }
                     if (atSessionEnd) {
                         finish()
                     }
@@ -576,14 +565,10 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun buildPendingUploadPromptMessage(pendingCount: Int, atSessionEnd: Boolean): String {
-        val itemLabel = if (pendingCount == 1) "match" else "matches"
+        val itemLabel = if (pendingCount == 1) "upload" else "uploads"
         val presentVerb = if (pendingCount == 1) "is" else "are"
         val pastVerb = if (pendingCount == 1) "was" else "were"
-        val syncHint = if (trainingLogUploader.canSyncPendingUploadsNow()) {
-            "Wi-Fi is available now, so you can sync immediately."
-        } else {
-            "Connect to Wi-Fi to sync them now, or keep them saved for the next session."
-        }
+        val syncHint = "Sync them now if the device is online, or keep them saved for the next session."
         return if (atSessionEnd) {
             "$pendingCount queued $itemLabel $presentVerb still saved on this device. $syncHint"
         } else {
@@ -595,128 +580,8 @@ class CameraActivity : AppCompatActivity() {
         startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
     }
 
-    private fun maybeUploadTrainingSample(
-        cropPath: String,
-        result: OcrDisplayResult?,
-        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
-    ) {
-        val uploadResult = result ?: return
-        val normalizedPath = File(cropPath).absolutePath
-        val decision = evaluateTrainingUpload(frameState, normalizedPath, uploadResult)
-        if (!decision.allowed) {
-            // showTopToast("Upload skipped: ${decision.reason}")
-            return
-        }
-        lastTrainingUploadPath = normalizedPath
-        showTopToast("Upload accepted: saving")
-        trainingLogUploader.maybeUpload(normalizedPath, uploadResult)
-    }
-
-    private fun evaluateTrainingUpload(
-        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
-        cropPath: String,
-        ocrResult: OcrDisplayResult,
-    ): UploadDecision {
-        if (ocrResult.text.isBlank()) {
-            return UploadDecision(false, "blank_ocr")
-        }
-        if (cropPath == lastTrainingUploadPath) {
-            return UploadDecision(false, "duplicate_crop")
-        }
-        val quality = frameState.quality
-        if (quality == null || !quality.passes) {
-            return UploadDecision(false, "quality_reject")
-        }
-        if (quality.totalScore < MIN_UPLOAD_QUALITY_SCORE) {
-            return UploadDecision(false, "low_quality_score")
-        }
-        val activeTrack = frameState.activeTrack ?: return UploadDecision(false, "missing_track")
-        if (activeTrack.ageFrames < 3) {
-            return UploadDecision(false, "unstable_track")
-        }
-        val normalizedOcr = normalizePlateTextForUpload(ocrResult.text)
-        if (normalizedOcr.isBlank()) {
-            return UploadDecision(false, "blank_ocr")
-        }
-        val supportingVotes = countTrackOcrVotes(frameState, normalizedOcr)
-        val hasLongerSimilarVote = hasLongerSimilarTrackVote(frameState, normalizedOcr)
-        val hasStrongSingleRead =
-            (ocrResult.confidence ?: 0f) >= STRONG_SINGLE_READ_CONFIDENCE &&
-                quality.totalScore >= STRONG_SINGLE_READ_QUALITY_SCORE &&
-                activeTrack.ageFrames >= STRONG_SINGLE_READ_MIN_TRACK_AGE &&
-                !hasLongerSimilarVote &&
-                !isAmbiguousOcrResult(ocrResult)
-        if (supportingVotes < MIN_TRACK_OCR_SUPPORT && hasLongerSimilarVote) {
-            return UploadDecision(false, "partial_ocr_conflict")
-        }
-        if (supportingVotes < MIN_TRACK_OCR_SUPPORT && !hasStrongSingleRead) {
-            return UploadDecision(false, "insufficient_ocr_support")
-        }
-        if (!isPlausiblePlateText(normalizedOcr)) {
-            return UploadDecision(false, "implausible_text")
-        }
-        if (isAmbiguousOcrResult(ocrResult)) {
-            return UploadDecision(false, "ambiguous_ocr")
-        }
-        val confidence = ocrResult.confidence
-        if (confidence != null && confidence < BuildConfig.TRAINING_LOGGER_MIN_CONFIDENCE.toFloat()) {
-            return UploadDecision(false, "low_ocr_confidence")
-        }
-        return UploadDecision(true, "accepted")
-    }
-
-    private fun normalizePlateTextForUpload(text: String): String {
-        return text.uppercase()
-            .filter { it in 'A'..'Z' || it in '0'..'9' }
-    }
-
-    private fun recordTrackOcrVote(
-        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
-        result: OcrDisplayResult?,
-    ) {
-        val trackId = frameState.activeTrack?.trackId ?: return
-        val normalizedText = result?.text?.let(::normalizePlateTextForUpload).orEmpty()
-        if (normalizedText.isBlank()) {
-            return
-        }
-        if (currentOcrVoteTrackId != trackId) {
-            currentOcrVoteTrackId = trackId
-            currentTrackOcrVotes.clear()
-        }
-        currentTrackOcrVotes.addLast(normalizedText)
-        while (currentTrackOcrVotes.size > OCR_VOTE_WINDOW_SIZE) {
-            currentTrackOcrVotes.removeFirst()
-        }
-    }
-
-    private fun countTrackOcrVotes(
-        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
-        normalizedText: String,
-    ): Int {
-        val trackId = frameState.activeTrack?.trackId ?: return 0
-        if (currentOcrVoteTrackId != trackId) {
-            return 0
-        }
-        return currentTrackOcrVotes.count { it == normalizedText }
-    }
-
-    private fun hasLongerSimilarTrackVote(
-        frameState: com.andre.alprprototype.alpr.PipelineDebugState,
-        normalizedText: String,
-    ): Boolean {
-        val trackId = frameState.activeTrack?.trackId ?: return false
-        if (currentOcrVoteTrackId != trackId) {
-            return false
-        }
-        return currentTrackOcrVotes.any { priorText ->
-            priorText != normalizedText &&
-                priorText.length > normalizedText.length &&
-                (priorText.startsWith(normalizedText) || priorText.endsWith(normalizedText))
-        }
-    }
-
     private fun shouldProcessConfirmedPlate(text: String): Boolean {
-        val normalizedText = normalizePlateTextForUpload(text)
+        val normalizedText = text.uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }
         if (normalizedText.isBlank()) {
             return false
         }
@@ -729,31 +594,6 @@ class CameraActivity : AppCompatActivity() {
         lastConfirmedPlateText = normalizedText
         lastConfirmedPlateAtMs = nowMs
         return true
-    }
-
-    private fun isPlausiblePlateText(text: String): Boolean {
-        if (text.length !in 5..8) {
-            return false
-        }
-        if (text.any { it !in 'A'..'Z' && it !in '0'..'9' }) {
-            return false
-        }
-        if (text.toSet().size == 1) {
-            return false
-        }
-        val dominantCount = text.groupingBy { it }.eachCount().values.maxOrNull() ?: 0
-        return dominantCount < text.length - 1
-    }
-
-    private fun isAmbiguousOcrResult(result: OcrDisplayResult): Boolean {
-        if (result.variantCount <= 1) {
-            return false
-        }
-        if (result.agreementCount >= 2) {
-            return false
-        }
-        val margin = result.scoreMargin ?: return true
-        return margin < MIN_OCR_SCORE_MARGIN
     }
 
     private fun applyStatusPanelState() {
@@ -796,12 +636,5 @@ class CameraActivity : AppCompatActivity() {
 
     companion object {
         private const val CONFIRMED_PLATE_COOLDOWN_MS = 4_000L
-        private const val MIN_UPLOAD_QUALITY_SCORE = 0.62f
-        private const val MIN_OCR_SCORE_MARGIN = 0.08f
-        private const val MIN_TRACK_OCR_SUPPORT = 2
-        private const val OCR_VOTE_WINDOW_SIZE = 4
-        private const val STRONG_SINGLE_READ_CONFIDENCE = 0.76f
-        private const val STRONG_SINGLE_READ_QUALITY_SCORE = 0.63f
-        private const val STRONG_SINGLE_READ_MIN_TRACK_AGE = 3
     }
 }
