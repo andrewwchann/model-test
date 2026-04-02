@@ -67,7 +67,14 @@ class ViolationManager(private val context: Context) {
             val json = synchronized(queueLock) {
                 gson.toJson(queuedViolations)
             }
-            queueFile.writeText(json)
+            val tempFile = File(queueFile.parentFile, "${queueFile.name}.tmp")
+            tempFile.writeText(json)
+            if (queueFile.exists() && !queueFile.delete()) {
+                throw IllegalStateException("Failed deleting old queue file")
+            }
+            if (!tempFile.renameTo(queueFile)) {
+                throw IllegalStateException("Failed replacing queue file")
+            }
             true
         } catch (e: Exception) {
             Log.e(tag, "Failed to save queue", e)
@@ -174,7 +181,11 @@ class ViolationManager(private val context: Context) {
 
     private fun stageViolationAssets(violation: ViolationEvent): ViolationEvent? {
         val stagedPlatePath = stageFile(violation.localPlatePath, "plate") ?: return null
-        val stagedVehiclePath = stageFile(violation.localVehiclePath, "vehicle") ?: return null
+        val stagedVehiclePath = stageFile(violation.localVehiclePath, "vehicle")
+        if (stagedVehiclePath == null) {
+            deleteFileQuietly(stagedPlatePath)
+            return null
+        }
         return violation.copy(
             localPlatePath = stagedPlatePath,
             localVehiclePath = stagedVehiclePath,
