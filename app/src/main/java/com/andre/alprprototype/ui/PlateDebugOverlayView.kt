@@ -35,12 +35,6 @@ class PlateDebugOverlayView @JvmOverloads constructor(
         strokeWidth = 10f
     }
 
-    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        textSize = 30f
-        style = Paint.Style.FILL
-    }
-
     private val assistedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#FF6B6B")
         style = Paint.Style.STROKE
@@ -76,38 +70,20 @@ class PlateDebugOverlayView @JvmOverloads constructor(
             return
         }
 
-        state.candidates.forEachIndexed { index, candidate ->
+        state.candidates.forEach { candidate ->
             val mapped = mapRect(candidate.boundingBox, sourceWidth, sourceHeight)
             canvas.drawRoundRect(mapped, 14f, 14f, detectionPaint)
-            canvas.drawText(
-                "raw ${index + 1} ${candidate.boundingBox.width().toInt()}x${candidate.boundingBox.height().toInt()}",
-                mapped.left,
-                mapped.top - 12f,
-                labelPaint,
-            )
         }
 
-        state.detections.forEachIndexed { index, detection ->
+        state.detections.forEach { detection ->
             val mapped = mapRect(detection.boundingBox, sourceWidth, sourceHeight)
             canvas.drawRoundRect(mapped, 18f, 18f, trackPaint)
-            canvas.drawText(
-                "flt ${index + 1} ${detection.boundingBox.width().toInt()}x${detection.boundingBox.height().toInt()}",
-                mapped.left,
-                mapped.top - 12f,
-                labelPaint,
-            )
         }
 
         state.activeTrack?.let { track ->
             val mapped = mapRect(track.boundingBox, sourceWidth, sourceHeight)
             val paint = if (state.quality?.passes == true) acceptedPaint else trackPaint
             canvas.drawRoundRect(mapped, 20f, 20f, paint)
-            canvas.drawText(
-                "trk ${track.trackId} ${track.boundingBox.width().toInt()}x${track.boundingBox.height().toInt()}",
-                mapped.left,
-                mapped.bottom + 34f,
-                labelPaint,
-            )
         }
 
         assistedTargetRect?.let { rect ->
@@ -118,7 +94,6 @@ class PlateDebugOverlayView @JvmOverloads constructor(
                 rect.bottom * height,
             )
             canvas.drawRoundRect(mapped, 20f, 20f, assistedPaint)
-            canvas.drawText("tap target", mapped.left, mapped.top - 12f, labelPaint)
         }
     }
 

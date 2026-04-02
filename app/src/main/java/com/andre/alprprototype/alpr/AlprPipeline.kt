@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.RectF
 import androidx.camera.core.ImageProxy
-import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -41,48 +40,11 @@ data class PipelineDebugState(
     val frameNumber: Long,
     val inputWidth: Int,
     val inputHeight: Int,
-    val scanRan: Boolean,
-    val candidateSource: String,
     val candidates: List<PlateCandidate>,
     val detections: List<PlateDetection>,
     val activeTrack: PlateTrack?,
     val quality: PlateQuality?,
-    val detectorDebugText: String?,
-) {
-    fun statusText(): String {
-        val lines = mutableListOf<String>()
-        lines += "Frame $frameNumber | ${inputWidth}x$inputHeight"
-        lines += if (scanRan) "Detector: ran via $candidateSource" else "Detector: skipped"
-        lines += "Candidates: ${candidates.size} | Plate-like detections: ${detections.size}"
-        candidates.firstOrNull()?.let {
-            lines += "Top candidate: ${it.boundingBox.asDebugString()} ${it.boundingBox.sizeString()} conf=${format(it.confidence)}"
-        } ?: run {
-            lines += "Top candidate: none"
-        }
-        detectorDebugText?.let { lines += it }
-        detections.firstOrNull()?.let {
-            lines += "Top detection: ${it.boundingBox.asDebugString()} ${it.boundingBox.sizeString()} conf=${format(it.confidence)}"
-        } ?: run {
-            lines += "Top detection: none"
-        }
-
-        val trackText = activeTrack?.let {
-            "Track: #${it.trackId} age=${it.ageFrames} src=${it.source} box=${it.boundingBox.asDebugString()} ${it.boundingBox.sizeString()}"
-        } ?: "Track: none"
-        lines += trackText
-
-        val qualityText = quality?.let {
-            val verdict = if (it.passes) "pass" else "reject"
-            "Quality: $verdict score=${format(it.totalScore)} blur=${format(it.blurScore)} width=${format(it.pixelWidth)} angle=${format(it.angleScore)}"
-        } ?: "Quality: waiting"
-        lines += qualityText
-
-        val reasonText = quality?.reasons?.takeIf { it.isNotEmpty() }?.joinToString() ?: "none"
-        lines += "Reject reasons: $reasonText"
-
-        return lines.joinToString("\n")
-    }
-}
+)
 
 class AlprPipeline(
     private val candidateGenerator: PlateCandidateGenerator = StaticSceneCandidateGenerator(),
@@ -122,13 +84,10 @@ class AlprPipeline(
             frameNumber = frameNumber,
             inputWidth = displayWidth,
             inputHeight = displayHeight,
-            scanRan = runScan,
-            candidateSource = candidateGenerator.name,
             candidates = candidates,
             detections = detections,
             activeTrack = activeTrack,
             quality = quality,
-            detectorDebugText = candidateGenerator.lastDebugInfo(),
         )
     }
 
@@ -161,7 +120,6 @@ interface PlateCandidateGenerator {
     val name: String
     fun generate(image: ImageProxy, uprightBitmapProvider: (() -> Bitmap?)? = null): List<PlateCandidate>
     fun close() = Unit
-    fun lastDebugInfo(): String? = null
 }
 
 interface PlateCandidateFilter {
@@ -492,8 +450,3 @@ private fun uprightFrameSize(image: ImageProxy): Pair<Int, Int> {
     }
 }
 
-private fun RectF.asDebugString(): String = String.format(Locale.US, "[%.0f, %.0f, %.0f, %.0f]", left, top, right, bottom)
-
-private fun RectF.sizeString(): String = String.format(Locale.US, "(%.0fx%.0f)", width(), height())
-
-private fun format(value: Float): String = String.format(Locale.US, "%.2f", value)

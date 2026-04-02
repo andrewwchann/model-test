@@ -67,7 +67,7 @@ class PlateFrameAnalyzer(
                 val totalDurationMs = (convertDurationMs ?: 0L) + pipelineDurationMs + cropDurationMs
                 Log.d(
                     "ALPR_PERF",
-                    "frame=$currentFrame scan=${state.scanRan} convertMs=${convertDurationMs ?: 0} " +
+                    "frame=$currentFrame convertMs=${convertDurationMs ?: 0} " +
                         "pipelineMs=$pipelineDurationMs cropMs=$cropDurationMs saved=${savedCropPath != null} " +
                         "track=${state.activeTrack?.trackId ?: 0} totalMs=$totalDurationMs",
                 )
@@ -97,6 +97,9 @@ class PlateFrameAnalyzer(
             for (gridX in 0 until MOTION_GRID_COLS) {
                 val sampleX = (((gridX + 0.5f) / MOTION_GRID_COLS) * width).toInt().coerceIn(0, width - 1)
                 val index = sampleY * rowStride + sampleX * pixelStride
+                if (index < 0 || index >= buffer.limit()) {
+                    return null
+                }
                 signature[gridY * MOTION_GRID_COLS + gridX] = buffer.get(index).toInt() and 0xFF
             }
         }

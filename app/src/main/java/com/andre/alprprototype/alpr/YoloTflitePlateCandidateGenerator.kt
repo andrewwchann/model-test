@@ -22,7 +22,6 @@ class YoloTflitePlateCandidateGenerator private constructor(
 ) : PlateCandidateGenerator {
 
     override val name: String = "yolo-tflite"
-    private var lastDebugText: String? = null
 
     override fun generate(image: ImageProxy, uprightBitmapProvider: (() -> Bitmap?)?): List<PlateCandidate> {
         val bitmap = uprightBitmapProvider?.invoke() ?: image.toUprightBitmap() ?: return emptyList()
@@ -38,13 +37,6 @@ class YoloTflitePlateCandidateGenerator private constructor(
         }
         return detections
             .map { detection ->
-                lastDebugText = buildLiveDebugText(
-                    image = image,
-                    uprightWidth = bitmap.width,
-                    uprightHeight = bitmap.height,
-                    uprightRect = detection.boundingBox,
-                    finalRect = detection.boundingBox,
-                )
                 PlateCandidate(
                     boundingBox = detection.boundingBox,
                     confidence = detection.confidence,
@@ -68,8 +60,6 @@ class YoloTflitePlateCandidateGenerator private constructor(
     override fun close() {
         interpreter.close()
     }
-
-    override fun lastDebugInfo(): String? = lastDebugText
 
     private fun preprocess(bitmap: Bitmap): PreprocessedFrame {
         val scale = min(inputWidth / bitmap.width.toFloat(), inputHeight / bitmap.height.toFloat())
@@ -152,16 +142,6 @@ class YoloTflitePlateCandidateGenerator private constructor(
                 confidence = detection.confidence,
             )
         }
-    }
-
-    private fun buildLiveDebugText(
-        image: ImageProxy,
-        uprightWidth: Int,
-        uprightHeight: Int,
-        uprightRect: RectF,
-        finalRect: RectF,
-    ): String {
-        return "Live frame: rot=${image.imageInfo.rotationDegrees} src=${image.width}x${image.height} upright=${uprightWidth}x${uprightHeight} upBox=${uprightRect.width().toInt()}x${uprightRect.height().toInt()} finalBox=${finalRect.width().toInt()}x${finalRect.height().toInt()}"
     }
 
     private fun decodeDetections(values: FloatArray, shape: IntArray): List<RawDetection> {
