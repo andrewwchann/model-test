@@ -18,12 +18,16 @@ data class AnalyzedFrame(
 class PlateFrameAnalyzer(
     private val pipeline: AlprPipeline = AlprPipeline(),
     private val cropSaver: BestPlateCropSaver,
+    private val shouldAnalyze: () -> Boolean = { true },
     private val onFrameAnalyzed: (AnalyzedFrame) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
     private val frameCounter = AtomicLong(0)
     override fun analyze(image: ImageProxy) {
         try {
+            if (!shouldAnalyze()) {
+                return
+            }
             val currentFrame = frameCounter.incrementAndGet()
             var convertDurationMs: Long? = null
             val uprightBitmap by lazy(LazyThreadSafetyMode.NONE) {
