@@ -31,6 +31,7 @@ class PlateFrameAnalyzer(
     override fun analyze(image: ImageProxy) {
         try {
             if (!shouldAnalyze()) {
+                resetMotionTracking()
                 return
             }
             val motionSignature = buildMotionSignature(image)
@@ -115,6 +116,12 @@ class PlateFrameAnalyzer(
             totalDelta += abs(previous[index] - current[index]).toFloat()
         }
         return totalDelta / previous.size
+    }
+
+    private fun resetMotionTracking() {
+        previousMotionSignature = null
+        stableFrameCount = 0
+        motionPauseActive = false
     }
 
     companion object {

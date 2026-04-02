@@ -29,6 +29,7 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import com.google.android.material.color.MaterialColors
 import androidx.lifecycle.lifecycleScope
 import com.andre.alprprototype.alpr.AlprPipeline
 import com.andre.alprprototype.alpr.AssistedPlateCropSaver
@@ -360,8 +361,16 @@ class CameraActivity : AppCompatActivity() {
 
         val mappedX = (x / binding.debugOverlay.width) * previewBitmap.width
         val mappedY = (y / binding.debugOverlay.height) * previewBitmap.height
-        val assistedCrop = assistedCropSaver.saveFromTap(previewBitmap, mappedX, mappedY)
-        previewBitmap.recycle()
+        val assistedCrop = try {
+            assistedCropSaver.saveFromTap(previewBitmap, mappedX, mappedY)
+        } catch (_: Exception) {
+            showTopToast("Unable to create assisted crop")
+            return
+        } finally {
+            if (!previewBitmap.isRecycled) {
+                previewBitmap.recycle()
+            }
+        }
         if (assistedCrop == null) {
             showTopToast("Unable to create assisted crop")
             return
@@ -408,23 +417,27 @@ class CameraActivity : AppCompatActivity() {
             hint = "Enter plate"
         }
 
-        MaterialAlertDialogBuilder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setCustomTitle(buildCenteredDialogTitle("Manual Plate Entry"))
             .setMessage("Assisted OCR could not read the plate reliably. Enter the plate manually.")
             .setView(input)
-            .setPositiveButton("Use plate") { _, _ ->
-                val manualPlate = input.text?.toString().orEmpty()
-                handleManualPlateEntry(manualPlate, cropPath)
-            }
+            .setPositiveButton("Use plate", null)
             .setNegativeButton("Cancel", null)
             .showTracked()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            val manualPlate = input.text?.toString().orEmpty()
+            if (handleManualPlateEntry(manualPlate, cropPath)) {
+                dialog.dismiss()
+            } else {
+                input.error = "Enter a valid plate"
+            }
+        }
     }
 
-    private fun handleManualPlateEntry(rawText: String, cropPath: String) {
+    private fun handleManualPlateEntry(rawText: String, cropPath: String): Boolean {
         val normalizedText = rawText.uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }
         if (normalizedText.isBlank()) {
-            showTopToast("Manual plate entry was empty")
-            return
+            return false
         }
         latestOcrResult = OcrDisplayResult(
             text = normalizedText,
@@ -438,13 +451,14 @@ class CameraActivity : AppCompatActivity() {
         binding.debugOverlay.showAssistedTarget(null)
         updateCropCaption()
         if (!shouldProcessConfirmedPlate(normalizedText)) {
-            return
+            return true
         }
         val validation = registryManager.isPlateValid(normalizedText)
         updateValidationUi(validation)
         if (validation == RegistryManager.PlateValidationResult.NOT_FOUND || validation == RegistryManager.PlateValidationResult.EXPIRED) {
             promptForViolationCollection(normalizedText, 0f, cropPath)
         }
+        return true
     }
 
     private fun promptForViolationCollection(plateText: String, confidence: Float, cropPath: String) {
@@ -620,9 +634,13 @@ class CameraActivity : AppCompatActivity() {
             localPlatePath = cropPath,
             localVehiclePath = vehiclePath
         )
-        violationManager.addViolation(violation)
-        updateUploadButtonText()
-        showTopToast("Violation queued: $plateText")
+        val result = violationManager.addViolation(violation)
+        if (result.isSuccess) {
+            updateUploadButtonText()
+            showTopToast("Violation queued: $plateText")
+        } else {
+            showTopToast("Failed to queue violation")
+        }
     }
 
     private fun updateValidationUi(result: RegistryManager.PlateValidationResult) {
@@ -792,12 +810,19 @@ class CameraActivity : AppCompatActivity() {
         return TextView(this).apply {
             text = title
             gravity = Gravity.CENTER
-            setTextColor(ContextCompat.getColor(context, android.R.color.black))
+            setTextColor(MaterialColors.getColor(this, com.google.android.material.R.attr.colorOnSurface))
             textSize = 20f
-            setPadding(48, 36, 48, 12)
+            setPadding(
+                24.dpToPx(),
+                18.dpToPx(),
+                24.dpToPx(),
+                6.dpToPx(),
+            )
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
     }
+
+    private fun Int.dpToPx(): Int = (this * resources.displayMetrics.density).toInt()
 
     private fun stylePendingUploadDialog(dialog: AlertDialog) {
         val syncColor = ContextCompat.getColor(this, R.color.dialog_button_sync)

@@ -5,10 +5,11 @@ import android.graphics.Bitmap
 import android.graphics.Rect
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.Locale
 
 class AssistedPlateCropSaver(context: Context) {
-    private val outputDir = File(context.filesDir, "assisted-alpr-crops").apply { mkdirs() }
+    private val outputDir = File(context.filesDir, "alpr-crops")
 
     fun saveFromTap(
         previewBitmap: Bitmap,
@@ -19,35 +20,56 @@ class AssistedPlateCropSaver(context: Context) {
             return null
         }
 
-        val cropRect = buildCropRect(previewBitmap.width, previewBitmap.height, tapX, tapY)
-        val cropped = Bitmap.createBitmap(
-            previewBitmap,
-            cropRect.left,
-            cropRect.top,
-            cropRect.width(),
-            cropRect.height(),
-        )
-
-        val filename = String.format(
-            Locale.US,
-            "assisted_plate_%d.jpg",
-            System.currentTimeMillis(),
-        )
-        val file = File(outputDir, filename)
-        FileOutputStream(file).use { stream ->
-            cropped.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+        if (!ensureOutputDir()) {
+            return null
         }
-        cropped.recycle()
 
-        return AssistedCropResult(
-            path = file.absolutePath,
-            normalizedRect = NormalizedRect(
-                left = cropRect.left / previewBitmap.width.toFloat(),
-                top = cropRect.top / previewBitmap.height.toFloat(),
-                right = cropRect.right / previewBitmap.width.toFloat(),
-                bottom = cropRect.bottom / previewBitmap.height.toFloat(),
-            ),
-        )
+        val cropRect = buildCropRect(previewBitmap.width, previewBitmap.height, tapX, tapY)
+        val cropped = try {
+            Bitmap.createBitmap(
+                previewBitmap,
+                cropRect.left,
+                cropRect.top,
+                cropRect.width(),
+                cropRect.height(),
+            )
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+
+        try {
+            val filename = String.format(Locale.US, "assisted_plate_%d.jpg", System.currentTimeMillis())
+            val file = File(outputDir, filename)
+            try {
+                FileOutputStream(file).use { stream ->
+                    val compressed = cropped.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+                    if (!compressed) {
+                        throw IOException("Bitmap compression failed")
+                    }
+                }
+            } catch (_: IOException) {
+                file.delete()
+                return null
+            }
+
+            return AssistedCropResult(
+                path = file.absolutePath,
+                normalizedRect = NormalizedRect(
+                    left = cropRect.left / previewBitmap.width.toFloat(),
+                    top = cropRect.top / previewBitmap.height.toFloat(),
+                    right = cropRect.right / previewBitmap.width.toFloat(),
+                    bottom = cropRect.bottom / previewBitmap.height.toFloat(),
+                ),
+            )
+        } finally {
+            if (!cropped.isRecycled) {
+                cropped.recycle()
+            }
+        }
+    }
+
+    private fun ensureOutputDir(): Boolean {
+        return outputDir.isDirectory || outputDir.mkdirs()
     }
 
     private fun buildCropRect(

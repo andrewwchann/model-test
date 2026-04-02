@@ -62,23 +62,36 @@ class ViolationManager(private val context: Context) {
         }
     }
 
-    private fun saveQueue() {
-        try {
+    private fun saveQueue(): Boolean {
+        return try {
             val json = synchronized(queueLock) {
                 gson.toJson(queuedViolations)
             }
             queueFile.writeText(json)
+            true
         } catch (e: Exception) {
             Log.e(tag, "Failed to save queue", e)
+            false
         }
     }
 
-    fun addViolation(violation: ViolationEvent) {
-        val stagedViolation = stageViolationAssets(violation) ?: return
+    fun addViolation(violation: ViolationEvent): Result<ViolationEvent> {
+        val stagedViolation = stageViolationAssets(violation)
+            ?: return Result.failure(IllegalStateException("Failed to stage violation assets"))
         synchronized(queueLock) {
             queuedViolations.add(stagedViolation)
         }
-        saveQueue()
+        if (!saveQueue()) {
+            synchronized(queueLock) {
+                queuedViolations.removeAll { it.queueKey() == stagedViolation.queueKey() }
+            }
+            deleteFileQuietly(stagedViolation.localPlatePath)
+            deleteFileQuietly(stagedViolation.localVehiclePath)
+            return Result.failure(IllegalStateException("Failed to persist queued violation"))
+        }
+        deleteOriginalAssetIfStaged(violation.localPlatePath, stagedViolation.localPlatePath)
+        deleteOriginalAssetIfStaged(violation.localVehiclePath, stagedViolation.localVehiclePath)
+        return Result.success(stagedViolation)
     }
 
     fun getQueueSize(): Int = synchronized(queueLock) { queuedViolations.size }
@@ -186,6 +199,31 @@ class ViolationManager(private val context: Context) {
         } catch (e: Exception) {
             Log.e(tag, "Failed staging queued file path=$normalizedSourcePath", e)
             null
+        }
+    }
+
+    private fun deleteOriginalAssetIfStaged(originalPath: String?, stagedPath: String?) {
+        if (originalPath.isNullOrBlank() || stagedPath.isNullOrBlank()) {
+            return
+        }
+        if (originalPath == stagedPath) {
+            return
+        }
+        try {
+            File(originalPath).delete()
+        } catch (e: Exception) {
+            Log.w(tag, "Failed deleting original staged asset path=$originalPath", e)
+        }
+    }
+
+    private fun deleteFileQuietly(path: String?) {
+        if (path.isNullOrBlank()) {
+            return
+        }
+        try {
+            File(path).delete()
+        } catch (e: Exception) {
+            Log.w(tag, "Failed deleting file path=$path", e)
         }
     }
 
