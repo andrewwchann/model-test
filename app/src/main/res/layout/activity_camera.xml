@@ -221,6 +221,26 @@
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 
+    <Button
+        android:id="@+id/centerAssistButton"
+        android:layout_width="0dp"
+        android:layout_height="48dp"
+        android:layout_marginStart="56dp"
+        android:layout_marginEnd="56dp"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/pill_background"
+        android:gravity="center"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
+        android:minWidth="0dp"
+        android:text="Capture Center Plate"
+        android:textAllCaps="false"
+        android:textColor="@android:color/white"
+        android:textSize="14sp"
+        app:layout_constraintBottom_toTopOf="@id/guideCard"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
     <ImageButton
         android:id="@+id/closeButton"
         android:layout_width="48dp"

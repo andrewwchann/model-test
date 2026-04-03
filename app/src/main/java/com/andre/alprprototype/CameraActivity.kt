@@ -82,6 +82,7 @@ class CameraActivity : AppCompatActivity() {
     private var isProcessingViolation = false
     private var framesSinceSavedCrop: Int = 0
     private var assistedPromptShown = false
+    private var centerCaptureArmed = false
     private val operatorDialogCount = AtomicInteger(0)
 
     private val permissionLauncher =
@@ -109,9 +110,10 @@ class CameraActivity : AppCompatActivity() {
         violationManager = ViolationManager(this)
         applyGuidePanelState()
         updateUploadButtonText()
-        binding.debugOverlay.setOnTapTargetRequested { x, y -> handleTapToAssistOcr(x, y) }
+        updateCenterAssistButton()
 
         binding.closeButton.setOnClickListener { attemptFinishSession() }
+        binding.centerAssistButton.setOnClickListener { handleCenterAssistButtonClick() }
         binding.guideHeader.setOnClickListener {
             isGuideExpanded = !isGuideExpanded
             applyGuidePanelState()
@@ -253,7 +255,7 @@ class CameraActivity : AppCompatActivity() {
                                         lastCropSource = CropSource.AUTO
                                         framesSinceSavedCrop = 0
                                         assistedPromptShown = false
-                                        binding.debugOverlay.showAssistedTarget(null)
+                                        resetCenterCaptureUi()
                                         updateCropPreview(frame.savedCropPath)
                                         requestOcrIfNeeded(frame.savedCropPath)
                                     } else {
@@ -310,13 +312,13 @@ class CameraActivity : AppCompatActivity() {
                 latestOcrState = if (result?.text.isNullOrBlank()) OcrUiState.UNAVAILABLE else OcrUiState.READY
                 updateCropCaption()
                 if (lastCropSource == CropSource.ASSISTED && shouldEscalateAssistedCropToManual(result)) {
-                    binding.debugOverlay.showAssistedTarget(null)
+                    resetCenterCaptureUi()
                     promptForManualPlateEntry(cropPath, result?.text)
                     return@runOnUiThread
                 }
 
                 if (lastCropSource == CropSource.ASSISTED) {
-                    binding.debugOverlay.showAssistedTarget(null)
+                    resetCenterCaptureUi()
                 }
 
                 val allowConfirmedActions = result?.text?.let { text ->
@@ -346,23 +348,46 @@ class CameraActivity : AppCompatActivity() {
             return
         }
         assistedPromptShown = true
-        showTopToast("Plate not detected. Tap the plate area to run assisted OCR.")
+        showTopToast("Plate not detected. Use Capture Center Plate to grab a centered crop.")
     }
 
-    private fun handleTapToAssistOcr(x: Float, y: Float) {
+    private fun handleCenterAssistButtonClick() {
+        if (centerCaptureArmed) {
+            captureCenterAssistCrop()
+        } else {
+            armCenterAssistCapture()
+        }
+    }
+
+    private fun armCenterAssistCapture() {
+        if (!canUpdateUi() || isProcessingViolation) {
+            return
+        }
+        val overlayRect = assistedCropSaver.previewCenterRect(
+            imageWidth = binding.debugOverlay.width,
+            imageHeight = binding.debugOverlay.height,
+        )
+        if (overlayRect == null) {
+            showTopToast("Preview not ready for assisted OCR")
+            return
+        }
+        centerCaptureArmed = true
+        binding.debugOverlay.showAssistedTarget(overlayRect)
+        updateCenterAssistButton()
+    }
+
+    private fun captureCenterAssistCrop() {
         if (!canUpdateUi() || isProcessingViolation) {
             return
         }
         val previewBitmap = binding.previewView.bitmap
-        if (previewBitmap == null || binding.debugOverlay.width <= 0 || binding.debugOverlay.height <= 0) {
+        if (previewBitmap == null) {
             showTopToast("Preview not ready for assisted OCR")
             return
         }
 
-        val mappedX = (x / binding.debugOverlay.width) * previewBitmap.width
-        val mappedY = (y / binding.debugOverlay.height) * previewBitmap.height
         val assistedCrop = try {
-            assistedCropSaver.saveFromTap(previewBitmap, mappedX, mappedY)
+            assistedCropSaver.saveFromCenter(previewBitmap)
         } catch (_: Exception) {
             showTopToast("Unable to create assisted crop")
             return
@@ -376,11 +401,13 @@ class CameraActivity : AppCompatActivity() {
             return
         }
 
+        centerCaptureArmed = false
         lastCropSource = CropSource.ASSISTED
         lastSavedCropPath = assistedCrop.path
         latestOcrResult = null
         latestOcrState = OcrUiState.PENDING
         binding.validationIndicator.visibility = View.GONE
+        updateCenterAssistButton()
         binding.debugOverlay.showAssistedTarget(assistedCrop.normalizedRect)
         updateCropPreview(assistedCrop.path)
         requestOcrIfNeeded(assistedCrop.path)
@@ -448,7 +475,7 @@ class CameraActivity : AppCompatActivity() {
             scoreMargin = null,
         )
         latestOcrState = OcrUiState.READY
-        binding.debugOverlay.showAssistedTarget(null)
+        resetCenterCaptureUi()
         updateCropCaption()
         if (!shouldProcessConfirmedPlate(normalizedText)) {
             return true
@@ -769,6 +796,16 @@ class CameraActivity : AppCompatActivity() {
         binding.guideToggle.setText(
             if (isGuideExpanded) R.string.session_status_collapse else R.string.session_status_expand,
         )
+    }
+
+    private fun resetCenterCaptureUi() {
+        centerCaptureArmed = false
+        binding.debugOverlay.showAssistedTarget(null)
+        updateCenterAssistButton()
+    }
+
+    private fun updateCenterAssistButton() {
+        binding.centerAssistButton.text = if (centerCaptureArmed) "Capture" else "Capture Center Plate"
     }
 
     private fun canUpdateUi(): Boolean {

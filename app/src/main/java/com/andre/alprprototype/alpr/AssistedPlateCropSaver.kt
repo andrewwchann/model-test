@@ -11,10 +11,45 @@ import java.util.Locale
 class AssistedPlateCropSaver(context: Context) {
     private val outputDir = File(context.filesDir, "alpr-crops")
 
+    fun previewCenterRect(imageWidth: Int, imageHeight: Int): NormalizedRect? {
+        if (imageWidth <= 0 || imageHeight <= 0) {
+            return null
+        }
+        val cropRect = buildCropRect(
+            imageWidth = imageWidth,
+            imageHeight = imageHeight,
+            tapX = imageWidth / 2f,
+            tapY = imageHeight / 2f,
+        )
+        return NormalizedRect(
+            left = cropRect.left / imageWidth.toFloat(),
+            top = cropRect.top / imageHeight.toFloat(),
+            right = cropRect.right / imageWidth.toFloat(),
+            bottom = cropRect.bottom / imageHeight.toFloat(),
+        )
+    }
+
+    fun saveFromCenter(previewBitmap: Bitmap): AssistedCropResult? {
+        if (previewBitmap.width <= 0 || previewBitmap.height <= 0) {
+            return null
+        }
+        return saveFromPoint(
+            previewBitmap = previewBitmap,
+            targetX = previewBitmap.width / 2f,
+            targetY = previewBitmap.height / 2f,
+        )
+    }
+
     fun saveFromTap(
         previewBitmap: Bitmap,
         tapX: Float,
         tapY: Float,
+    ): AssistedCropResult? = saveFromPoint(previewBitmap, tapX, tapY)
+
+    private fun saveFromPoint(
+        previewBitmap: Bitmap,
+        targetX: Float,
+        targetY: Float,
     ): AssistedCropResult? {
         if (previewBitmap.width <= 0 || previewBitmap.height <= 0) {
             return null
@@ -24,7 +59,7 @@ class AssistedPlateCropSaver(context: Context) {
             return null
         }
 
-        val cropRect = buildCropRect(previewBitmap.width, previewBitmap.height, tapX, tapY)
+        val cropRect = buildCropRect(previewBitmap.width, previewBitmap.height, targetX, targetY)
         val cropped = try {
             Bitmap.createBitmap(
                 previewBitmap,
