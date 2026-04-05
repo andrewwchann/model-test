@@ -16,7 +16,10 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.UUID
 
-class ViolationManager(private val context: Context) {
+class ViolationManager(
+    private val context: Context,
+    private val apiFactory: (() -> ViolationApi)? = null,
+) {
     private val tag = "ViolationManager"
     private val gson = Gson()
     private val queueFile = File(context.filesDir, "violation_queue.json")
@@ -24,8 +27,16 @@ class ViolationManager(private val context: Context) {
     private val queueLock = Any()
     
     private val api: ViolationApi by lazy {
+        apiFactory?.invoke() ?: createDefaultApi()
+    }
+
+    private fun createDefaultApi(): ViolationApi {
         val logging = HttpLoggingInterceptor { message -> Log.d("API_LOG", message) }
-        logging.level = HttpLoggingInterceptor.Level.BODY
+        logging.level = if (BuildConfig.DEBUG) {
+            HttpLoggingInterceptor.Level.BODY
+        } else {
+            HttpLoggingInterceptor.Level.NONE
+        }
 
         val client = OkHttpClient.Builder()
             .addInterceptor(logging)
@@ -33,7 +44,7 @@ class ViolationManager(private val context: Context) {
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
 
-        Retrofit.Builder()
+        return Retrofit.Builder()
             .baseUrl("https://lrxxawq4kk.execute-api.us-east-1.amazonaws.com/")
             .client(client)
             .addConverterFactory(GsonConverterFactory.create())

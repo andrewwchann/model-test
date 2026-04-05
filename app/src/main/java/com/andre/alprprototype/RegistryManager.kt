@@ -14,7 +14,10 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
-class RegistryManager(private val context: Context) {
+class RegistryManager(
+    private val context: Context,
+    private val apiFactory: (() -> RegistryApi)? = null,
+) {
     private val tag = "RegistryManager"
     private val gson = Gson()
     private val cacheFile = File(context.filesDir, "plate_registry.json")
@@ -23,14 +26,22 @@ class RegistryManager(private val context: Context) {
     private var registeredPlates: Map<String, RegistryPlate> = emptyMap()
 
     private val api: RegistryApi by lazy {
+        apiFactory?.invoke() ?: createDefaultApi()
+    }
+
+    private fun createDefaultApi(): RegistryApi {
         val logging = HttpLoggingInterceptor { message -> Log.d("API_LOG", message) }
-        logging.level = HttpLoggingInterceptor.Level.BODY
+        logging.level = if (BuildConfig.DEBUG) {
+            HttpLoggingInterceptor.Level.BODY
+        } else {
+            HttpLoggingInterceptor.Level.NONE
+        }
 
         val client = OkHttpClient.Builder()
             .addInterceptor(logging)
             .build()
 
-        Retrofit.Builder()
+        return Retrofit.Builder()
             .baseUrl("https://lrxxawq4kk.execute-api.us-east-1.amazonaws.com/")
             .client(client)
             .addConverterFactory(GsonConverterFactory.create())
@@ -58,10 +69,7 @@ class RegistryManager(private val context: Context) {
 
     suspend fun syncRegistry(): Result<Int> = withContext(Dispatchers.IO) {
         try {
-            // Using version=0 as requested by user's URL
             val plates = api.getRegistry(version = 0)
-            // Print out what is received from the API as requested
-            Log.d(tag, "Received from API: ${gson.toJson(plates)}")
             
             val json = gson.toJson(plates)
             cacheFile.writeText(json)

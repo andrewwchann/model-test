@@ -9,6 +9,13 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
+import com.andre.alprprototype.ocr.DecodedPlate
+import com.andre.alprprototype.ocr.ModelValidation
+import com.andre.alprprototype.ocr.PlateConfig
+import com.andre.alprprototype.ocr.PlateOcrMath
+import com.andre.alprprototype.ocr.PlateOcrRecognitionFlow
+import com.andre.alprprototype.ocr.PreparedInput
+import com.andre.alprprototype.ocr.ScoredOcrCandidate
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
@@ -69,36 +76,19 @@ class PlateOcrEngine(context: Context) {
                     }
                     null
                 } else {
-                    val candidates = mutableListOf<ScoredOcrCandidate>()
-                    val variants = buildVariants(bitmap)
                     var inferenceDurationMs = 0L
                     var variantsTried = 0
-                    
-                    for (variant in variants) {
+                    val recognition = PlateOcrRecognitionFlow.recognize(
+                        fileExists = true,
+                        filePath = file.absolutePath,
+                        bitmap = bitmap,
+                        buildVariants = ::buildVariants,
+                    ) { variant ->
                         variantsTried += 1
                         val inferenceStartNs = System.nanoTime()
-                        val current = runInference(variant, file.absolutePath)
-                        inferenceDurationMs += nanosToMillis(System.nanoTime() - inferenceStartNs)
-                        if (current != null) {
-                            candidates += current
-                            val bestSoFar = candidates.maxByOrNull { it.score }
-                            // Exit early once a very confident OCR result is found.
-                            // exit early to save CPU/Time.
-                            if (bestSoFar != null && current.confidence >= 0.92f) {
-                                break
-                            }
+                        runInference(variant, file.absolutePath).also {
+                            inferenceDurationMs += nanosToMillis(System.nanoTime() - inferenceStartNs)
                         }
-                    }
-
-                    val bestResult = candidates.maxByOrNull { it.score }
-                    val agreementCount = bestResult?.let { best ->
-                        candidates.count { it.text == best.text }
-                    } ?: 0
-                    val scoreMargin = bestResult?.let { best ->
-                        val secondBest = candidates
-                            .filterNot { it === best }
-                            .maxByOrNull { it.score }
-                        secondBest?.let { best.score - it.score }
                     }
 
                     if (BuildConfig.ALPR_PERF_LOGS_ENABLED) {
@@ -106,21 +96,12 @@ class PlateOcrEngine(context: Context) {
                         Log.d(
                             "ALPR_PERF",
                             "ocr file=${file.name} decodeMs=$decodeDurationMs inferMs=$inferenceDurationMs " +
-                                "variants=$variantsTried agree=$agreementCount margin=${scoreMargin ?: -1f} " +
-                                "text='${bestResult?.text ?: ""}' totalMs=$totalDurationMs",
+                                "variants=$variantsTried agree=${recognition?.agreementCount ?: 0} margin=${recognition?.scoreMargin ?: -1f} " +
+                                "text='${recognition?.text ?: ""}' totalMs=$totalDurationMs",
                         )
                     }
 
-                    bestResult?.let {
-                        OcrDisplayResult(
-                            text = it.text,
-                            sourcePath = file.absolutePath,
-                            confidence = it.confidence,
-                            agreementCount = agreementCount,
-                            variantCount = variantsTried,
-                            scoreMargin = scoreMargin,
-                        )
-                    }
+                    recognition
                 }
             } catch (t: Throwable) {
                 Log.e(tag, "ocr failed for path=$cropPath", t)
@@ -159,93 +140,15 @@ class PlateOcrEngine(context: Context) {
         }
     }
 
-    private fun preprocess(bitmap: Bitmap): PreparedInput {
-        val targetWidth = config.imgWidth
-        val targetHeight = config.imgHeight
-        
-        // Reliability Pillar: Use bilinear filtering for better OCR quality on small plates
-        val resized = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
-        
-        val buffer = ByteBuffer.allocateDirect(targetWidth * targetHeight * 3)
-        val pixels = IntArray(targetWidth * targetHeight)
-        resized.getPixels(pixels, 0, targetWidth, 0, 0, targetWidth, targetHeight)
+    private fun preprocess(bitmap: Bitmap): PreparedInput = PlateOcrMath.preprocess(bitmap, config)
 
-        // Optimization: Manual loop is still fastest for ARGB -> RGB UINT8 conversion in pure Kotlin
-        // but we ensure we are reusing the pixel array to reduce GC pressure.
-        for (pixel in pixels) {
-            buffer.put(((pixel shr 16) and 0xFF).toByte())
-            buffer.put(((pixel shr 8) and 0xFF).toByte())
-            buffer.put((pixel and 0xFF).toByte())
-        }
-        buffer.rewind()
+    private fun extractPlateLogits(rawValue: Any?): Array<FloatArray>? = PlateOcrMath.extractPlateLogits(rawValue)
 
-        return PreparedInput(
-            buffer = buffer,
-            shape = longArrayOf(1, targetHeight.toLong(), targetWidth.toLong(), 3),
-            width = targetWidth,
-            height = targetHeight,
-        )
-    }
+    private fun decodeFixedSlots(logits: Array<FloatArray>): DecodedPlate = PlateOcrMath.decodeFixedSlots(logits, config)
 
-    private fun extractPlateLogits(rawValue: Any?): Array<FloatArray>? {
-        return when (rawValue) {
-            is Array<*> -> {
-                val first = rawValue.firstOrNull()
-                when {
-                    rawValue.isArrayOf<FloatArray>() -> rawValue.filterIsInstance<FloatArray>().toTypedArray()
-                    first is Array<*> && first.isArrayOf<FloatArray>() ->
-                        first.filterIsInstance<FloatArray>().toTypedArray()
-                    else -> null
-                }
-            }
-            else -> null
-        }
-    }
+    private fun normalizePlateText(raw: String): String = PlateOcrMath.normalizePlateText(raw, config.padChar)
 
-    private fun decodeFixedSlots(logits: Array<FloatArray>): DecodedPlate {
-        val chars = StringBuilder()
-        val slotPredictions = mutableListOf<SlotPrediction>()
-
-        for (slotIndex in logits.indices) {
-            val slot = logits[slotIndex]
-            var bestIndex = 0
-            var bestValue = Float.NEGATIVE_INFINITY
-            for (classIndex in slot.indices) {
-                if (slot[classIndex] > bestValue) {
-                    bestValue = slot[classIndex]
-                    bestIndex = classIndex
-                }
-            }
-
-            val predictedChar = config.alphabet.getOrNull(bestIndex) ?: config.padChar
-            chars.append(predictedChar)
-            slotPredictions += SlotPrediction(
-                slotIndex = slotIndex,
-                classIndex = bestIndex,
-                character = predictedChar,
-                confidence = bestValue,
-            )
-        }
-
-        val rawText = chars.toString()
-        val trimmed = rawText.trimEnd(config.padChar).trim()
-        val averageConfidence = if (slotPredictions.isEmpty()) 0f else slotPredictions.map { it.confidence }.average().toFloat()
-        return DecodedPlate(
-            rawText = rawText,
-            finalText = trimmed,
-            averageConfidence = averageConfidence,
-            slots = slotPredictions,
-        )
-    }
-
-    private fun normalizePlateText(raw: String): String {
-        return raw.trimEnd(config.padChar).trim()
-    }
-
-    private fun scoreCandidate(text: String, averageConfidence: Float): Float {
-        // Reliability: Reward longer strings slightly as they are less likely to be noise
-        return averageConfidence + (text.length * 0.02f)
-    }
+    private fun scoreCandidate(text: String, averageConfidence: Float): Float = PlateOcrMath.scoreCandidate(text, averageConfidence)
 
     private fun validateModelContract(): ModelValidation {
         val inputEntry = session.inputInfo.entries.firstOrNull() ?: throw IllegalStateException("OCR model has no inputs")
@@ -259,63 +162,11 @@ class PlateOcrEngine(context: Context) {
         )
     }
 
-    private fun buildVariants(bitmap: Bitmap): List<Bitmap> {
-        val variants = mutableListOf<Bitmap>()
-        variants += bitmap // Original
-        // Reliability: Different crops help if the detector bounding box was slightly off
-        focusedBandCrop(bitmap, 0.20f, 0.85f)?.let { variants += it }
-        return variants.distinctBy { "${it.width}x${it.height}" }
-    }
+    private fun buildVariants(bitmap: Bitmap): List<Bitmap> = PlateOcrMath.buildVariants(bitmap)
 
-    private fun focusedBandCrop(source: Bitmap, topFraction: Float, bottomFraction: Float): Bitmap? {
-        val top = (source.height * topFraction).toInt().coerceIn(0, source.height - 1)
-        val bottom = (source.height * bottomFraction).toInt().coerceIn(top + 1, source.height)
-        if (bottom <= top) return null
-        return Bitmap.createBitmap(source, 0, top, source.width, bottom - top)
-    }
+    private fun focusedBandCrop(source: Bitmap, topFraction: Float, bottomFraction: Float): Bitmap? =
+        PlateOcrMath.focusedBandCrop(source, topFraction, bottomFraction)
 }
-
-private data class PreparedInput(
-    val buffer: ByteBuffer,
-    val shape: LongArray,
-    val width: Int,
-    val height: Int,
-)
-
-private data class ScoredOcrCandidate(
-    val text: String,
-    val score: Float,
-    val confidence: Float,
-)
-
-private data class DecodedPlate(
-    val rawText: String,
-    val finalText: String,
-    val averageConfidence: Float,
-    val slots: List<SlotPrediction>,
-)
-
-private data class SlotPrediction(
-    val slotIndex: Int,
-    val classIndex: Int,
-    val character: Char,
-    val confidence: Float,
-)
-
-private data class ModelValidation(
-    val inputName: String,
-    val plateOutputName: String,
-)
-
-private data class PlateConfig(
-    val maxPlateSlots: Int,
-    val alphabet: String,
-    val padChar: Char,
-    val imgHeight: Int,
-    val imgWidth: Int,
-    val keepAspectRatio: Boolean,
-    val imageColorMode: String,
-)
 
 private fun loadPlateConfig(context: Context, assetPath: String): PlateConfig {
     val values = mutableMapOf<String, String>()

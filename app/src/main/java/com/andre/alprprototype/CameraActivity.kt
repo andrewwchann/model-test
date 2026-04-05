@@ -42,6 +42,24 @@ import com.andre.alprprototype.alpr.AlprPipeline
 import com.andre.alprprototype.alpr.AssistedPlateCropSaver
 import com.andre.alprprototype.alpr.BestPlateCropSaver
 import com.andre.alprprototype.databinding.ActivityCameraBinding
+import com.andre.alprprototype.ocr.AssistedOcrPolicy
+import com.andre.alprprototype.ocr.AssistedOcrPolicyConfig
+import com.andre.alprprototype.ocr.PlateRecognitionAction
+import com.andre.alprprototype.ocr.PlateRecognitionFlow
+import com.andre.alprprototype.ocr.PlateTextNormalizer
+import com.andre.alprprototype.session.CameraCropSource
+import com.andre.alprprototype.session.CameraSessionPolicy
+import com.andre.alprprototype.session.CenterAssistArmDecision
+import com.andre.alprprototype.session.CenterAssistCaptureDecision
+import com.andre.alprprototype.session.CenterAssistFlow
+import com.andre.alprprototype.session.ConfirmedPlateTracker
+import com.andre.alprprototype.session.EvidenceFlowState
+import com.andre.alprprototype.session.OcrCallbackFlow
+import com.andre.alprprototype.session.OcrResultUiState
+import com.andre.alprprototype.session.PendingUploadFlow
+import com.andre.alprprototype.session.PendingUploadPromptFormatter
+import com.andre.alprprototype.session.SessionOperationFlow
+import com.andre.alprprototype.session.ViolationReviewFlow
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.launch
 import java.io.File
@@ -85,13 +103,12 @@ class CameraActivity : AppCompatActivity() {
     private var hasPromptedPendingUploadSyncOnStart: Boolean = false
     private var promptPendingUploadSyncOnResume: Boolean = false
     private val isShuttingDown = AtomicBoolean(false)
-    private var isProcessingViolation = false
     private var framesSinceSavedCrop: Int = 0
     private var assistedPromptShown = false
     private var centerCaptureArmed = false
     private val operatorDialogCount = AtomicInteger(0)
     private var isAnalyzerAttached = false
-    private var isEvidenceFlowActive = false
+    private val evidenceFlowState = EvidenceFlowState()
     private val confirmedPlateTracker = ConfirmedPlateTracker(CONFIRMED_PLATE_COOLDOWN_MS)
 
     private val permissionLauncher =
@@ -162,41 +179,47 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun syncRegistry() {
-        binding.syncButton.isEnabled = false
-        binding.syncButton.text = "Syncing..."
+        val loadingState = SessionOperationFlow.registrySyncLoadingState()
+        binding.syncButton.isEnabled = loadingState.enabled
+        binding.syncButton.setText(loadingState.textRes)
         lifecycleScope.launch {
             val result = registryManager.syncRegistry()
-            if (result.isSuccess) {
-                Toast.makeText(this@CameraActivity, "Registry synced: ${result.getOrNull()} plates", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this@CameraActivity, "Sync failed", Toast.LENGTH_SHORT).show()
-            }
-            binding.syncButton.isEnabled = true
-            binding.syncButton.text = "Sync Registry"
+            val outcome = SessionOperationFlow.registrySyncOutcome(result.isSuccess, result.getOrNull())
+            val message = outcome.formatArg?.let { getString(outcome.messageRes, it) } ?: getString(outcome.messageRes)
+            Toast.makeText(this@CameraActivity, message, Toast.LENGTH_SHORT).show()
+            val idleState = SessionOperationFlow.registrySyncIdleState()
+            binding.syncButton.isEnabled = idleState.enabled
+            binding.syncButton.setText(idleState.textRes)
         }
     }
 
     private fun uploadQueue() {
         if (violationManager.getQueueSize() == 0) {
-            Toast.makeText(this, "Queue is empty", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(SessionOperationFlow.queueUploadEmpty().messageRes), Toast.LENGTH_SHORT).show()
             return
         }
-        binding.uploadQueueButton.isEnabled = false
-        binding.uploadQueueButton.text = "Uploading..."
+        val loadingState = SessionOperationFlow.queueUploadLoadingState()
+        binding.uploadQueueButton.isEnabled = loadingState.enabled
+        binding.uploadQueueButton.setText(loadingState.textRes)
         lifecycleScope.launch {
             val result = violationManager.uploadQueue()
-            if (result.isSuccess) {
-                Toast.makeText(this@CameraActivity, "Uploaded ${result.getOrNull()} violations", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this@CameraActivity, "Upload failed: ${result.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
-            }
+            val outcome = SessionOperationFlow.queueUploadOutcome(
+                isSuccess = result.isSuccess,
+                count = result.getOrNull(),
+                errorMessage = result.exceptionOrNull()?.message,
+            )
+            val message = outcome.formatArg?.let { getString(outcome.messageRes, it) } ?: getString(outcome.messageRes)
+            Toast.makeText(this@CameraActivity, message, if (outcome.longMessage) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
             updateUploadButtonText()
-            binding.uploadQueueButton.isEnabled = true
+            binding.uploadQueueButton.isEnabled = SessionOperationFlow.queueUploadIdleState().enabled
         }
     }
 
     private fun updateUploadButtonText() {
-        binding.uploadQueueButton.text = "Upload (${violationManager.getQueueSize()})"
+        binding.uploadQueueButton.text = getString(
+            SessionOperationFlow.queueUploadIdleState().textRes,
+            violationManager.getQueueSize(),
+        )
     }
 
     private fun hasCameraPermission(): Boolean {
@@ -279,7 +302,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun requestOcrIfNeeded(cropPath: String) {
-        if (cropPath == lastOcrRequestedPath || isProcessingViolation) {
+        if (!CameraSessionPolicy.shouldRequestOcr(cropPath, lastOcrRequestedPath, evidenceFlowState.isProcessingViolation)) {
             return
         }
         lastOcrRequestedPath = cropPath
@@ -287,37 +310,38 @@ class CameraActivity : AppCompatActivity() {
         latestOcrState = OcrUiState.PENDING
         plateOcrEngine.recognize(cropPath) { result ->
             runOnUiThread {
-                if (!canUpdateUi() || cropPath != lastOcrRequestedPath || isProcessingViolation) {
+                val decision = OcrCallbackFlow.decide(
+                    canUpdateUi = canUpdateUi(),
+                    cropMatchesLatestRequest = cropPath == lastOcrRequestedPath,
+                    isProcessingViolation = evidenceFlowState.isProcessingViolation,
+                    cropSource = lastCropSource.toDecisionSource(),
+                    result = result,
+                    shouldEscalateAssistedCropToManual = ::shouldEscalateAssistedCropToManual,
+                    shouldProcessConfirmedPlate = ::shouldProcessConfirmedPlate,
+                    validator = registryManager::isPlateValid,
+                )
+                if (!decision.shouldApply) {
                     return@runOnUiThread
                 }
                 latestOcrResult = result
-                latestOcrState = if (result?.text.isNullOrBlank()) OcrUiState.UNAVAILABLE else OcrUiState.READY
-                if (lastCropSource == CropSource.ASSISTED && shouldEscalateAssistedCropToManual(result)) {
+                latestOcrState = when (decision.uiState) {
+                    OcrResultUiState.READY -> OcrUiState.READY
+                    OcrResultUiState.UNAVAILABLE -> OcrUiState.UNAVAILABLE
+                }
+                if (decision.shouldResetCenterCapture) {
                     resetCenterCaptureUi()
-                    promptForManualPlateEntry(cropPath, result?.text)
+                }
+                if (decision.promptManualEntry) {
+                    promptForManualPlateEntry(cropPath, decision.manualEntrySuggestion)
                     return@runOnUiThread
                 }
-
-                if (lastCropSource == CropSource.ASSISTED) {
-                    resetCenterCaptureUi()
-                }
-
-                val allowConfirmedActions = result?.text?.let { text ->
-                    shouldProcessConfirmedPlate(text)
-                } ?: false
-
-                if (allowConfirmedActions) {
-                    result?.text?.let { text ->
-                        val validation = registryManager.isPlateValid(text)
-                        when (validation) {
-                            RegistryManager.PlateValidationResult.NOT_FOUND,
-                            RegistryManager.PlateValidationResult.EXPIRED -> {
-                                promptForViolationCollection(text, result.confidence ?: 0f, cropPath)
-                            }
-                            RegistryManager.PlateValidationResult.VALID -> {
-                                showTopToast(getString(R.string.plate_valid_message, text))
-                            }
-                        }
+                when (decision.recognitionAction) {
+                    PlateRecognitionAction.IGNORE -> Unit
+                    PlateRecognitionAction.SHOW_VALID -> {
+                        showTopToast(getString(R.string.plate_valid_message, decision.normalizedText))
+                    }
+                    PlateRecognitionAction.PROMPT_VIOLATION -> {
+                        promptForViolationCollection(decision.normalizedText.orEmpty(), result?.confidence ?: 0f, cropPath)
                     }
                 }
             }
@@ -325,10 +349,14 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun maybePromptAssistedCapture(frame: AnalyzedFrame) {
-        if (frame.savedCropPath != null || isProcessingViolation || assistedPromptShown) {
-            return
-        }
-        if (framesSinceSavedCrop < ASSISTED_PROMPT_FRAME_THRESHOLD) {
+        if (!CameraSessionPolicy.shouldPromptAssistedCapture(
+                hasSavedCrop = frame.savedCropPath != null,
+                isProcessingViolation = evidenceFlowState.isProcessingViolation,
+                assistedPromptShown = assistedPromptShown,
+                framesSinceSavedCrop = framesSinceSavedCrop,
+                threshold = ASSISTED_PROMPT_FRAME_THRESHOLD,
+            )
+        ) {
             return
         }
         assistedPromptShown = true
@@ -344,55 +372,59 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun armCenterAssistCapture() {
-        if (!canUpdateUi() || isProcessingViolation) {
-            return
-        }
-        val overlayRect = assistedCropSaver.previewCenterRect(
+        when (
+            val decision = CenterAssistFlow.decideArm(
+                canUpdateUi = canUpdateUi(),
+                isProcessingViolation = evidenceFlowState.isProcessingViolation,
+                overlayRect = assistedCropSaver.previewCenterRect(
             imageWidth = binding.debugOverlay.width,
             imageHeight = binding.debugOverlay.height,
-        )
-        if (overlayRect == null) {
-            showTopToast("Preview not ready for assisted OCR")
-            return
+                ),
+            )
+        ) {
+            CenterAssistArmDecision.Ignore -> return
+            CenterAssistArmDecision.PreviewNotReady -> {
+                showTopToast("Preview not ready for assisted OCR")
+                return
+            }
+            is CenterAssistArmDecision.Arm -> {
+                centerCaptureArmed = true
+                binding.debugOverlay.showAssistedTarget(decision.overlayRect)
+                updateCenterAssistButton()
+            }
         }
-        centerCaptureArmed = true
-        binding.debugOverlay.showAssistedTarget(overlayRect)
-        updateCenterAssistButton()
     }
 
     private fun captureCenterAssistCrop() {
-        if (!canUpdateUi() || isProcessingViolation) {
-            return
-        }
-        val previewBitmap = binding.previewView.bitmap
-        if (previewBitmap == null) {
-            showTopToast("Preview not ready for assisted OCR")
-            return
-        }
-
-        val assistedCrop = try {
-            assistedCropSaver.saveFromCenter(previewBitmap)
-        } catch (_: Exception) {
-            showTopToast("Unable to create assisted crop")
-            return
-        } finally {
-            if (!previewBitmap.isRecycled) {
-                previewBitmap.recycle()
+        when (
+            val decision = CenterAssistFlow.capture(
+                canUpdateUi = canUpdateUi(),
+                isProcessingViolation = evidenceFlowState.isProcessingViolation,
+                previewBitmap = binding.previewView.bitmap,
+                saveFromCenter = assistedCropSaver::saveFromCenter,
+            )
+        ) {
+            CenterAssistCaptureDecision.Ignore -> return
+            CenterAssistCaptureDecision.PreviewNotReady -> {
+                showTopToast("Preview not ready for assisted OCR")
+                return
+            }
+            CenterAssistCaptureDecision.CaptureFailed -> {
+                showTopToast("Unable to create assisted crop")
+                return
+            }
+            is CenterAssistCaptureDecision.Captured -> {
+                val assistedCrop = decision.crop
+                centerCaptureArmed = false
+                lastCropSource = CropSource.ASSISTED
+                lastSavedCropPath = assistedCrop.path
+                latestOcrResult = null
+                latestOcrState = OcrUiState.PENDING
+                updateCenterAssistButton()
+                binding.debugOverlay.showAssistedTarget(assistedCrop.normalizedRect)
+                requestOcrIfNeeded(assistedCrop.path)
             }
         }
-        if (assistedCrop == null) {
-            showTopToast("Unable to create assisted crop")
-            return
-        }
-
-        centerCaptureArmed = false
-        lastCropSource = CropSource.ASSISTED
-        lastSavedCropPath = assistedCrop.path
-        latestOcrResult = null
-        latestOcrState = OcrUiState.PENDING
-        updateCenterAssistButton()
-        binding.debugOverlay.showAssistedTarget(assistedCrop.normalizedRect)
-        requestOcrIfNeeded(assistedCrop.path)
     }
 
     private fun shouldEscalateAssistedCropToManual(result: OcrDisplayResult?): Boolean {
@@ -434,39 +466,32 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun handleManualPlateEntry(rawText: String, cropPath: String): Boolean {
-        val normalizedText = PlateTextNormalizer.normalize(rawText)
-        if (normalizedText.isBlank()) {
+        val decision = ViolationReviewFlow.handleManualPlateEntry(
+            rawText = rawText,
+            cropPath = cropPath,
+            shouldProcessConfirmedPlate = ::shouldProcessConfirmedPlate,
+            validator = registryManager::isPlateValid,
+        )
+        if (!decision.accepted) {
             return false
         }
-        latestOcrResult = OcrDisplayResult(
-            text = normalizedText,
-            sourcePath = cropPath,
-            confidence = null,
-            agreementCount = 0,
-            variantCount = 0,
-            scoreMargin = null,
-        )
+        latestOcrResult = decision.ocrResult
         latestOcrState = OcrUiState.READY
         resetCenterCaptureUi()
-        if (!shouldProcessConfirmedPlate(normalizedText)) {
-            return true
-        }
-        val validation = registryManager.isPlateValid(normalizedText)
-        when (validation) {
-            RegistryManager.PlateValidationResult.NOT_FOUND,
-            RegistryManager.PlateValidationResult.EXPIRED -> {
-                promptForViolationCollection(normalizedText, 0f, cropPath)
+        when (decision.recognitionAction) {
+            PlateRecognitionAction.IGNORE -> Unit
+            PlateRecognitionAction.SHOW_VALID -> {
+                showTopToast(getString(R.string.plate_valid_message, decision.normalizedText))
             }
-            RegistryManager.PlateValidationResult.VALID -> {
-                showTopToast(getString(R.string.plate_valid_message, normalizedText))
+            PlateRecognitionAction.PROMPT_VIOLATION -> {
+                promptForViolationCollection(decision.normalizedText.orEmpty(), 0f, cropPath)
             }
         }
         return true
     }
 
     private fun promptForViolationCollection(plateText: String, confidence: Float, cropPath: String) {
-        isProcessingViolation = true
-        isEvidenceFlowActive = true
+        evidenceFlowState.beginViolationReview()
         updateSessionChromeVisibility()
         val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_violation_found, null)
         val cropImage = dialogView.findViewById<ImageView>(R.id.violationCropImage)
@@ -502,15 +527,14 @@ class CameraActivity : AppCompatActivity() {
                 renderPlateDetails(correctedPlate)
                 if (validation == RegistryManager.PlateValidationResult.VALID) {
                     dialog.dismiss()
-                    isProcessingViolation = false
+                    evidenceFlowState.finish()
                     showTopToast("Plate corrected: valid registration found")
                 }
             }
         }
 
         dismissButton.setOnClickListener {
-            isEvidenceFlowActive = false
-            isProcessingViolation = false
+            evidenceFlowState.finish()
             updateSessionChromeVisibility()
             dialog.dismiss()
         }
@@ -560,31 +584,29 @@ class CameraActivity : AppCompatActivity() {
         cropPath: String,
         onPlateUpdated: ((String, RegistryManager.PlateValidationResult) -> Unit)? = null,
     ): RegistryManager.PlateValidationResult? {
-        val normalizedText = PlateTextNormalizer.normalize(rawText)
-        if (normalizedText.isBlank()) {
+        val decision = ViolationReviewFlow.handleViolationPlateEdit(
+            rawText = rawText,
+            confidence = confidence,
+            cropPath = cropPath,
+            previousResult = latestOcrResult,
+            validator = registryManager::isPlateValid,
+        )
+        if (!decision.accepted) {
             return null
         }
-
-        latestOcrResult = OcrDisplayResult(
-            text = normalizedText,
-            sourcePath = cropPath,
-            confidence = confidence,
-            agreementCount = latestOcrResult?.agreementCount ?: 0,
-            variantCount = latestOcrResult?.variantCount ?: 0,
-            scoreMargin = latestOcrResult?.scoreMargin,
-        )
+        latestOcrResult = decision.ocrResult
         latestOcrState = OcrUiState.READY
-
-        val validation = registryManager.isPlateValid(normalizedText)
-        onPlateUpdated?.invoke(normalizedText, validation)
+        val validation = decision.validation ?: return null
+        onPlateUpdated?.invoke(decision.normalizedText.orEmpty(), validation)
         if (onPlateUpdated == null && validation == RegistryManager.PlateValidationResult.VALID) {
-            isProcessingViolation = false
-            showTopToast("Plate corrected: valid registration found")
+            evidenceFlowState.finish()
+            showTopToast(getString(R.string.plate_valid_message, decision.normalizedText))
         }
         return validation
     }
 
     private fun promptToCaptureVehiclePhoto(plateText: String, confidence: Float, cropPath: String) {
+        evidenceFlowState.beginCapturePrompt()
         val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_capture_evidence, null)
         val dialog = MaterialAlertDialogBuilder(this)
             .setView(dialogView)
@@ -594,8 +616,7 @@ class CameraActivity : AppCompatActivity() {
         styleBottomDialog(dialog)
 
         dialogView.findViewById<View>(R.id.evidenceCancelButton).setOnClickListener {
-            isEvidenceFlowActive = false
-            isProcessingViolation = false
+            evidenceFlowState.finish()
             updateSessionChromeVisibility()
             dialog.dismiss()
         }
@@ -611,7 +632,8 @@ class CameraActivity : AppCompatActivity() {
     private fun takeVehiclePhoto(onCaptured: (String) -> Unit) {
         val capture = imageCapture ?: run {
             Toast.makeText(this, "Camera not ready", Toast.LENGTH_SHORT).show()
-            isProcessingViolation = false
+            evidenceFlowState.finish()
+            updateSessionChromeVisibility()
             return
         }
 
@@ -635,7 +657,8 @@ class CameraActivity : AppCompatActivity() {
                 override fun onError(exception: ImageCaptureException) {
                     runOnUiThread {
                         Toast.makeText(this@CameraActivity, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
-                        isProcessingViolation = false
+                        evidenceFlowState.finish()
+                        updateSessionChromeVisibility()
                     }
                 }
             }
@@ -643,6 +666,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun confirmVehiclePhoto(plateText: String, confidence: Float, cropPath: String, vehiclePhotoPath: String) {
+        evidenceFlowState.beginPhotoConfirmation()
         val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_confirm_vehicle_photo, null)
         dialogView.findViewById<ImageView>(R.id.confirmVehicleImage).setImageBitmap(loadDisplayBitmap(vehiclePhotoPath))
 
@@ -652,9 +676,8 @@ class CameraActivity : AppCompatActivity() {
             .showTracked()
 
         dialogView.findViewById<View>(R.id.acceptVehicleButton).setOnClickListener {
-            isEvidenceFlowActive = false
+            evidenceFlowState.finish()
             queueViolation(plateText, confidence, cropPath, vehiclePhotoPath)
-            isProcessingViolation = false
             updateSessionChromeVisibility()
             dialog.dismiss()
         }
@@ -671,13 +694,12 @@ class CameraActivity : AppCompatActivity() {
         sdf.timeZone = TimeZone.getTimeZone("UTC")
         val timestamp = sdf.format(Date())
 
-        val violation = ViolationEvent(
-            rawOcrText = plateText,
-            confidenceScore = confidence,
+        val violation = ViolationReviewFlow.buildViolationEvent(
+            plateText = plateText,
+            confidence = confidence,
             timestamp = timestamp,
-            operatorId = "Device_01", // Placeholder
-            localPlatePath = cropPath,
-            localVehiclePath = vehiclePath
+            cropPath = cropPath,
+            vehiclePath = vehiclePath,
         )
         val result = violationManager.addViolation(violation)
         if (result.isSuccess) {
@@ -741,7 +763,8 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun maybePromptToSyncPendingUploadsOnStart() {
-        if (hasPromptedPendingUploadSyncOnStart || violationManager.getQueueSize() <= 0) {
+        val pendingCount = violationManager.getQueueSize()
+        if (hasPromptedPendingUploadSyncOnStart || !PendingUploadFlow.shouldShowPrompt(pendingCount)) {
             return
         }
         hasPromptedPendingUploadSyncOnStart = true
@@ -749,7 +772,8 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun attemptFinishSession() {
-        if (violationManager.getQueueSize() <= 0) {
+        val pendingCount = violationManager.getQueueSize()
+        if (PendingUploadFlow.shouldFinishWithoutPrompt(pendingCount, atSessionEnd = true)) {
             finish()
             return
         }
@@ -758,35 +782,37 @@ class CameraActivity : AppCompatActivity() {
 
     private fun showPendingUploadSyncPrompt(atSessionEnd: Boolean) {
         val pendingCount = violationManager.getQueueSize()
-        if (pendingCount <= 0) {
-            if (atSessionEnd) {
+        if (!PendingUploadFlow.shouldShowPrompt(pendingCount)) {
+            if (PendingUploadFlow.shouldFinishWithoutPrompt(pendingCount, atSessionEnd)) {
                 finish()
             }
             return
         }
 
+        val promptSpec = PendingUploadFlow.promptSpec(atSessionEnd)
         val dialog = AlertDialog.Builder(this)
-            .setTitle(if (atSessionEnd) "Queued uploads before closing" else "Queued uploads saved")
+            .setTitle(promptSpec.titleRes)
             .setMessage(buildPendingUploadPromptMessage(pendingCount, atSessionEnd))
-            .setPositiveButton("Sync now") { _, _ ->
+            .setPositiveButton(R.string.pending_upload_sync_now) { _, _ ->
                 lifecycleScope.launch {
                     val result = violationManager.uploadQueue()
                     updateUploadButtonText()
-                    if (result.isSuccess) {
-                        showTopToast("Uploaded ${result.getOrNull() ?: 0} queued item(s)")
+                    val outcome = PendingUploadFlow.syncOutcome(result.isSuccess, result.getOrNull(), atSessionEnd)
+                    if (outcome.shouldShowSuccess) {
+                        showTopToast(getString(R.string.pending_upload_synced_message, outcome.uploadedCount))
                     } else {
-                        showTopToast("Queued uploads not synced")
+                        showTopToast(getString(R.string.pending_upload_not_synced))
                     }
-                    if (atSessionEnd) {
+                    if (outcome.shouldFinishSession) {
                         finish()
                     }
                 }
             }
-            .setNeutralButton("Wi-Fi settings") { _, _ ->
+            .setNeutralButton(R.string.pending_upload_wifi_settings) { _, _ ->
                 promptPendingUploadSyncOnResume = true
                 openWifiSettings()
             }
-            .setNegativeButton(if (atSessionEnd) "End session" else "Later") { _, _ ->
+            .setNegativeButton(promptSpec.negativeButtonRes) { _, _ ->
                 if (atSessionEnd) {
                     finish()
                 }
@@ -816,9 +842,9 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun updateSessionChromeVisibility() {
-        val showSessionChrome = SessionUiPolicy.shouldShowSessionChrome(
+        val showSessionChrome = CameraSessionPolicy.shouldShowSessionChrome(
             operatorDialogVisible = isOperatorDialogVisible(),
-            evidenceFlowActive = isEvidenceFlowActive,
+            evidenceFlowActive = evidenceFlowState.isActive,
         )
         binding.topActionCard.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
         binding.centerAssistButton.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
@@ -836,7 +862,13 @@ class CameraActivity : AppCompatActivity() {
 
     private fun attachAnalyzerIfNeeded() {
         val imageAnalysis = analysisUseCase ?: return
-        if (isAnalyzerAttached || isOperatorDialogVisible() || isEvidenceFlowActive || !canUseCamera()) {
+        if (!CameraSessionPolicy.shouldAttachAnalyzer(
+                isAnalyzerAttached = isAnalyzerAttached,
+                operatorDialogVisible = isOperatorDialogVisible(),
+                evidenceFlowActive = evidenceFlowState.isActive,
+                canUseCamera = canUseCamera(),
+            )
+        ) {
             return
         }
         imageAnalysis.setAnalyzer(
@@ -962,6 +994,11 @@ class CameraActivity : AppCompatActivity() {
         private const val MIN_ASSISTED_OCR_AGREEMENT = 2
         private const val MIN_ASSISTED_SCORE_MARGIN = 0.08f
         private const val MIN_ASSISTED_TEXT_LENGTH = 5
+    }
+
+    private fun CropSource.toDecisionSource(): CameraCropSource = when (this) {
+        CropSource.AUTO -> CameraCropSource.AUTO
+        CropSource.ASSISTED -> CameraCropSource.ASSISTED
     }
 
     private enum class CropSource {
