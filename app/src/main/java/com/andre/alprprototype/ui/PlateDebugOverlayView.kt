@@ -57,6 +57,12 @@ class PlateDebugOverlayView @JvmOverloads constructor(
         invalidate()
     }
 
+    fun clearDebugState() {
+        latestState = null
+        assistedTargetRect = null
+        invalidate()
+    }
+
     fun setOnTapTargetRequested(listener: ((Float, Float) -> Unit)?) {
         onTapTargetRequested = listener
     }

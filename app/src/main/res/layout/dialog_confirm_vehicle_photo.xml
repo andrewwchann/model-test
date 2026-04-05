@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="@string/confirm_vehicle_photo_title"
+            android:textColor="@color/on_surface"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <ImageView
+            android:id="@+id/confirmVehicleImage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:adjustViewBounds="true"
+            android:background="@drawable/preview_image_background"
+            android:contentDescription="@string/confirm_vehicle_photo_title"
+            android:padding="4dp"
+            android:scaleType="fitCenter" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/retakeVehicleButton"
+                android:layout_width="wrap_content"
+                android:layout_height="42dp"
+                android:layout_marginEnd="10dp"
+                android:backgroundTint="@color/dialog_button_dismiss"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:minWidth="104dp"
+                android:paddingStart="18dp"
+                android:paddingEnd="18dp"
+                android:text="@string/confirm_vehicle_photo_retake"
+                android:textAllCaps="false"
+                android:textColor="@android:color/black"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/acceptVehicleButton"
+                android:layout_width="wrap_content"
+                android:layout_height="42dp"
+                android:layout_marginStart="10dp"
+                android:backgroundTint="@android:color/holo_green_dark"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:minWidth="104dp"
+                android:paddingStart="18dp"
+                android:paddingEnd="18dp"
+                android:text="@string/confirm_vehicle_photo_accept"
+                android:textAllCaps="false"
+                android:textColor="@android:color/black"
+                android:textSize="14sp" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>
