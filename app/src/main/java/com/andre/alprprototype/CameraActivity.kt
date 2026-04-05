@@ -93,6 +93,7 @@ class CameraActivity : AppCompatActivity() {
     private var centerCaptureArmed = false
     private val operatorDialogCount = AtomicInteger(0)
     private var isAnalyzerAttached = false
+    private var isEvidenceFlowActive = false
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -309,8 +310,14 @@ class CameraActivity : AppCompatActivity() {
                 if (allowConfirmedActions) {
                     result?.text?.let { text ->
                         val validation = registryManager.isPlateValid(text)
-                        if (validation == RegistryManager.PlateValidationResult.NOT_FOUND || validation == RegistryManager.PlateValidationResult.EXPIRED) {
-                            promptForViolationCollection(text, result.confidence ?: 0f, cropPath)
+                        when (validation) {
+                            RegistryManager.PlateValidationResult.NOT_FOUND,
+                            RegistryManager.PlateValidationResult.EXPIRED -> {
+                                promptForViolationCollection(text, result.confidence ?: 0f, cropPath)
+                            }
+                            RegistryManager.PlateValidationResult.VALID -> {
+                                showTopToast(getString(R.string.plate_valid_message, text))
+                            }
                         }
                     }
                 }
@@ -456,14 +463,22 @@ class CameraActivity : AppCompatActivity() {
             return true
         }
         val validation = registryManager.isPlateValid(normalizedText)
-        if (validation == RegistryManager.PlateValidationResult.NOT_FOUND || validation == RegistryManager.PlateValidationResult.EXPIRED) {
-            promptForViolationCollection(normalizedText, 0f, cropPath)
+        when (validation) {
+            RegistryManager.PlateValidationResult.NOT_FOUND,
+            RegistryManager.PlateValidationResult.EXPIRED -> {
+                promptForViolationCollection(normalizedText, 0f, cropPath)
+            }
+            RegistryManager.PlateValidationResult.VALID -> {
+                showTopToast(getString(R.string.plate_valid_message, normalizedText))
+            }
         }
         return true
     }
 
     private fun promptForViolationCollection(plateText: String, confidence: Float, cropPath: String) {
         isProcessingViolation = true
+        isEvidenceFlowActive = true
+        updateSessionChromeVisibility()
         val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_violation_found, null)
         val cropImage = dialogView.findViewById<ImageView>(R.id.violationCropImage)
         val plateTextView = dialogView.findViewById<TextView>(R.id.violationPlateText)
@@ -505,7 +520,9 @@ class CameraActivity : AppCompatActivity() {
         }
 
         dismissButton.setOnClickListener {
+            isEvidenceFlowActive = false
             isProcessingViolation = false
+            updateSessionChromeVisibility()
             dialog.dismiss()
         }
 
@@ -588,7 +605,9 @@ class CameraActivity : AppCompatActivity() {
         styleBottomDialog(dialog)
 
         dialogView.findViewById<View>(R.id.evidenceCancelButton).setOnClickListener {
+            isEvidenceFlowActive = false
             isProcessingViolation = false
+            updateSessionChromeVisibility()
             dialog.dismiss()
         }
 
@@ -644,8 +663,10 @@ class CameraActivity : AppCompatActivity() {
             .showTracked()
 
         dialogView.findViewById<View>(R.id.acceptVehicleButton).setOnClickListener {
+            isEvidenceFlowActive = false
             queueViolation(plateText, confidence, cropPath, vehiclePhotoPath)
             isProcessingViolation = false
+            updateSessionChromeVisibility()
             dialog.dismiss()
         }
 
@@ -861,7 +882,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun updateSessionChromeVisibility() {
-        val showSessionChrome = !isOperatorDialogVisible()
+        val showSessionChrome = !isOperatorDialogVisible() && !isEvidenceFlowActive
         binding.topActionCard.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
         binding.centerAssistButton.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
         binding.guideCard.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
@@ -878,7 +899,7 @@ class CameraActivity : AppCompatActivity() {
 
     private fun attachAnalyzerIfNeeded() {
         val imageAnalysis = analysisUseCase ?: return
-        if (isAnalyzerAttached || isOperatorDialogVisible() || !canUseCamera()) {
+        if (isAnalyzerAttached || isOperatorDialogVisible() || isEvidenceFlowActive || !canUseCamera()) {
             return
         }
         imageAnalysis.setAnalyzer(
