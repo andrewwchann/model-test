@@ -417,22 +417,22 @@ class CameraActivity : AppCompatActivity() {
             filters = arrayOf(InputFilter.LengthFilter(10))
             setText(suggestedText.orEmpty())
             setSelection(text.length)
-            hint = "Enter plate"
+            hint = getString(R.string.manual_plate_entry_hint)
         }
 
         val dialog = MaterialAlertDialogBuilder(this)
-            .setCustomTitle(buildCenteredDialogTitle("Manual Plate Entry"))
-            .setMessage("Assisted OCR could not read the plate reliably. Enter the plate manually.")
+            .setCustomTitle(buildCenteredDialogTitle(getString(R.string.manual_plate_entry_title)))
+            .setMessage(R.string.manual_plate_entry_message)
             .setView(input)
-            .setPositiveButton("Use plate", null)
-            .setNegativeButton("Cancel", null)
+            .setPositiveButton(R.string.manual_plate_entry_confirm, null)
+            .setNegativeButton(R.string.dialog_cancel, null)
             .showTracked()
         dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
             val manualPlate = input.text?.toString().orEmpty()
             if (handleManualPlateEntry(manualPlate, cropPath)) {
                 dialog.dismiss()
             } else {
-                input.error = "Enter a valid plate"
+                input.error = getString(R.string.plate_validation_error)
             }
         }
     }
@@ -485,7 +485,7 @@ class CameraActivity : AppCompatActivity() {
         renderPlateDetails(plateText)
 
         val dialog = MaterialAlertDialogBuilder(this)
-            .setTitle("Violation Found")
+            .setTitle(R.string.violation_found_title)
             .setView(dialogView)
             .setCancelable(false)
             .showTracked()
@@ -526,15 +526,15 @@ class CameraActivity : AppCompatActivity() {
             filters = arrayOf(InputFilter.LengthFilter(10))
             setText(originalPlateText)
             setSelection(text.length)
-            hint = "Edit plate"
+            hint = getString(R.string.edit_plate_hint)
         }
 
         val dialog = MaterialAlertDialogBuilder(this)
-            .setTitle("Edit Plate")
-            .setMessage("Correct the plate text before continuing.")
+            .setTitle(R.string.edit_plate_title)
+            .setMessage(R.string.edit_plate_message)
             .setView(input)
-            .setPositiveButton("Use corrected", null)
-            .setNegativeButton("Cancel", null)
+            .setPositiveButton(R.string.edit_plate_confirm, null)
+            .setNegativeButton(R.string.dialog_cancel, null)
             .setCancelable(false)
             .showTracked()
         dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
@@ -543,7 +543,7 @@ class CameraActivity : AppCompatActivity() {
             if (validation != null) {
                 dialog.dismiss()
             } else {
-                input.error = "Enter a valid plate"
+                input.error = getString(R.string.plate_validation_error)
             }
         }
     }
@@ -688,7 +688,9 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun loadDisplayBitmap(imagePath: String): Bitmap? {
-        val bitmap = BitmapFactory.decodeFile(imagePath) ?: return null
+        val targetWidth = (resources.displayMetrics.widthPixels * 0.9f).toInt().coerceAtLeast(1)
+        val targetHeight = (resources.displayMetrics.heightPixels * 0.6f).toInt().coerceAtLeast(1)
+        val bitmap = decodeSampledBitmap(imagePath, targetWidth, targetHeight) ?: return null
         val rotationDegrees = try {
             when (ExifInterface(imagePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
                 ExifInterface.ORIENTATION_ROTATE_90 -> 90f
@@ -710,6 +712,42 @@ class CameraActivity : AppCompatActivity() {
             bitmap.recycle()
         }
         return rotatedBitmap
+    }
+
+    private fun decodeSampledBitmap(imagePath: String, targetWidth: Int, targetHeight: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        BitmapFactory.decodeFile(imagePath, bounds)
+
+        val sampleSize = calculateInSampleSize(bounds, targetWidth, targetHeight)
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
+        return BitmapFactory.decodeFile(imagePath, decodeOptions)
+    }
+
+    private fun calculateInSampleSize(
+        options: BitmapFactory.Options,
+        targetWidth: Int,
+        targetHeight: Int,
+    ): Int {
+        val imageHeight = options.outHeight
+        val imageWidth = options.outWidth
+        var sampleSize = 1
+
+        if (imageHeight <= 0 || imageWidth <= 0) {
+            return sampleSize
+        }
+
+        while ((imageHeight / (sampleSize * 2)) >= targetHeight &&
+            (imageWidth / (sampleSize * 2)) >= targetWidth
+        ) {
+            sampleSize *= 2
+        }
+
+        return sampleSize.coerceAtLeast(1)
     }
 
     private fun styleBottomDialog(dialog: AlertDialog) {

@@ -19,6 +19,17 @@
     <string name="session_debug_guide">Overlay colors: yellow = static scene candidate, cyan = filtered plate-like region, green = tracked region accepted for OCR. When a possible violation is found, review the crop, confirm or edit the extracted plate, then capture a full-vehicle evidence photo.</string>
     <string name="close_camera">Close camera</string>
     <string name="camera_permission_required">Camera permission is required to run a live ALPR session.</string>
+    <string name="violation_found_title">Violation Found</string>
+    <string name="manual_plate_entry_title">Manual Plate Entry</string>
+    <string name="manual_plate_entry_message">Assisted OCR could not read the plate reliably. Enter the plate manually.</string>
+    <string name="manual_plate_entry_hint">Enter plate</string>
+    <string name="manual_plate_entry_confirm">Use plate</string>
+    <string name="edit_plate_title">Edit Plate</string>
+    <string name="edit_plate_message">Correct the plate text before continuing.</string>
+    <string name="edit_plate_hint">Edit plate</string>
+    <string name="edit_plate_confirm">Use corrected</string>
+    <string name="dialog_cancel">Cancel</string>
+    <string name="plate_validation_error">Enter a valid plate</string>
     <string name="violation_dialog_detected_plate_label">Extracted plate</string>
     <string name="violation_dialog_edit_plate">Edit</string>
     <string name="violation_dialog_dismiss">No</string>

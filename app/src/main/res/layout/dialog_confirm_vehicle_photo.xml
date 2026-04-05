@@ -58,7 +58,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="42dp"
                 android:layout_marginStart="10dp"
-                android:backgroundTint="@android:color/holo_green_dark"
+                android:backgroundTint="?attr/colorPrimary"
                 android:insetTop="0dp"
                 android:insetBottom="0dp"
                 android:minWidth="104dp"
@@ -66,7 +66,7 @@
                 android:paddingEnd="18dp"
                 android:text="@string/confirm_vehicle_photo_accept"
                 android:textAllCaps="false"
-                android:textColor="@android:color/black"
+                android:textColor="?attr/colorOnPrimary"
                 android:textSize="14sp" />
         </LinearLayout>
     </LinearLayout>
