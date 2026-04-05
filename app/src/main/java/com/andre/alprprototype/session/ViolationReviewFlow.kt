@@ -1,5 +1,6 @@
 package com.andre.alprprototype.session
 
+import com.andre.alprprototype.R
 import com.andre.alprprototype.OcrDisplayResult
 import com.andre.alprprototype.RegistryManager
 import com.andre.alprprototype.ViolationEvent
@@ -21,7 +22,39 @@ internal data class ViolationPlateEditDecision(
     val normalizedText: String? = null,
 )
 
+internal data class ManualPlateEntryUiDecision(
+    val accepted: Boolean,
+    val ocrResult: OcrDisplayResult? = null,
+    val shouldResetCenterCapture: Boolean = false,
+    val toastMessageRes: Int? = null,
+    val toastFormatArg: String? = null,
+    val violationPlateText: String? = null,
+)
+
+internal data class StandalonePlateEditUiDecision(
+    val shouldFinishEvidenceFlow: Boolean,
+    val toastMessageRes: Int? = null,
+)
+
+internal data class PlateInputDialogSpec(
+    val titleRes: Int,
+    val messageRes: Int,
+    val hintRes: Int,
+    val positiveButtonRes: Int,
+    val negativeButtonRes: Int,
+    val initialText: String,
+    val maxLength: Int,
+    val useCenteredTitle: Boolean = false,
+)
+
+internal data class ViolationReviewDisplayState(
+    val plateText: String,
+    val statusTextRes: Int,
+)
+
 internal object ViolationReviewFlow {
+    private const val PLATE_INPUT_MAX_LENGTH = 10
+
     fun handleManualPlateEntry(
         rawText: String,
         cropPath: String,
@@ -51,6 +84,43 @@ internal object ViolationReviewFlow {
             recognitionAction = recognition.action,
             normalizedText = recognition.normalizedText,
         )
+    }
+
+    fun manualEntryUiDecision(
+        rawText: String,
+        cropPath: String,
+        shouldProcessConfirmedPlate: (String) -> Boolean,
+        validator: (String) -> RegistryManager.PlateValidationResult,
+    ): ManualPlateEntryUiDecision {
+        val decision = handleManualPlateEntry(
+            rawText = rawText,
+            cropPath = cropPath,
+            shouldProcessConfirmedPlate = shouldProcessConfirmedPlate,
+            validator = validator,
+        )
+        if (!decision.accepted) {
+            return ManualPlateEntryUiDecision(accepted = false)
+        }
+        return when (decision.recognitionAction) {
+            PlateRecognitionAction.IGNORE -> ManualPlateEntryUiDecision(
+                accepted = true,
+                ocrResult = decision.ocrResult,
+                shouldResetCenterCapture = true,
+            )
+            PlateRecognitionAction.SHOW_VALID -> ManualPlateEntryUiDecision(
+                accepted = true,
+                ocrResult = decision.ocrResult,
+                shouldResetCenterCapture = true,
+                toastMessageRes = R.string.plate_valid_message,
+                toastFormatArg = decision.normalizedText,
+            )
+            PlateRecognitionAction.PROMPT_VIOLATION -> ManualPlateEntryUiDecision(
+                accepted = true,
+                ocrResult = decision.ocrResult,
+                shouldResetCenterCapture = true,
+                violationPlateText = decision.normalizedText,
+            )
+        }
     }
 
     fun handleViolationPlateEdit(
@@ -84,6 +154,60 @@ internal object ViolationReviewFlow {
             ocrResult = ocrResult,
             validation = recognition.validationResult,
             normalizedText = recognition.normalizedText,
+        )
+    }
+
+    fun standalonePlateEditUiDecision(validation: RegistryManager.PlateValidationResult): StandalonePlateEditUiDecision {
+        return if (validation == RegistryManager.PlateValidationResult.VALID) {
+            StandalonePlateEditUiDecision(
+                shouldFinishEvidenceFlow = true,
+                toastMessageRes = R.string.plate_corrected_valid_message,
+            )
+        } else {
+            StandalonePlateEditUiDecision(shouldFinishEvidenceFlow = false)
+        }
+    }
+
+    fun registryStatusTextRes(result: RegistryManager.PlateValidationResult): Int {
+        return when (result) {
+            RegistryManager.PlateValidationResult.VALID -> R.string.registry_status_valid
+            RegistryManager.PlateValidationResult.EXPIRED -> R.string.registry_status_expired
+            RegistryManager.PlateValidationResult.NOT_FOUND -> R.string.registry_status_not_found
+        }
+    }
+
+    fun manualPlateInputSpec(suggestedText: String?): PlateInputDialogSpec {
+        return PlateInputDialogSpec(
+            titleRes = R.string.manual_plate_entry_title,
+            messageRes = R.string.manual_plate_entry_message,
+            hintRes = R.string.manual_plate_entry_hint,
+            positiveButtonRes = R.string.manual_plate_entry_confirm,
+            negativeButtonRes = R.string.dialog_cancel,
+            initialText = suggestedText.orEmpty(),
+            maxLength = PLATE_INPUT_MAX_LENGTH,
+            useCenteredTitle = true,
+        )
+    }
+
+    fun violationPlateEditSpec(originalPlateText: String): PlateInputDialogSpec {
+        return PlateInputDialogSpec(
+            titleRes = R.string.edit_plate_title,
+            messageRes = R.string.edit_plate_message,
+            hintRes = R.string.edit_plate_hint,
+            positiveButtonRes = R.string.edit_plate_confirm,
+            negativeButtonRes = R.string.dialog_cancel,
+            initialText = originalPlateText,
+            maxLength = PLATE_INPUT_MAX_LENGTH,
+        )
+    }
+
+    fun reviewDisplayState(
+        plateText: String,
+        validation: RegistryManager.PlateValidationResult,
+    ): ViolationReviewDisplayState {
+        return ViolationReviewDisplayState(
+            plateText = plateText,
+            statusTextRes = registryStatusTextRes(validation),
         )
     }
 

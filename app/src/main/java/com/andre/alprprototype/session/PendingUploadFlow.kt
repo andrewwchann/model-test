@@ -7,10 +7,22 @@ internal data class PendingUploadPromptSpec(
     val negativeButtonRes: Int,
 )
 
+internal data class PendingUploadPromptDecision(
+    val shouldShowPrompt: Boolean,
+    val shouldFinishSession: Boolean,
+    val promptSpec: PendingUploadPromptSpec? = null,
+)
+
 internal data class PendingUploadSyncOutcome(
     val shouldShowSuccess: Boolean,
     val uploadedCount: Int,
     val shouldFinishSession: Boolean,
+)
+
+internal data class PendingUploadActionDecision(
+    val shouldFinishSession: Boolean = false,
+    val shouldOpenWifiSettings: Boolean = false,
+    val shouldPromptOnResume: Boolean = false,
 )
 
 internal object PendingUploadFlow {
@@ -30,6 +42,24 @@ internal object PendingUploadFlow {
         )
     }
 
+    fun promptDecision(
+        pendingCount: Int,
+        atSessionEnd: Boolean,
+    ): PendingUploadPromptDecision {
+        return if (shouldShowPrompt(pendingCount)) {
+            PendingUploadPromptDecision(
+                shouldShowPrompt = true,
+                shouldFinishSession = false,
+                promptSpec = promptSpec(atSessionEnd),
+            )
+        } else {
+            PendingUploadPromptDecision(
+                shouldShowPrompt = false,
+                shouldFinishSession = shouldFinishWithoutPrompt(pendingCount, atSessionEnd),
+            )
+        }
+    }
+
     fun syncOutcome(
         isSuccess: Boolean,
         uploadedCount: Int?,
@@ -40,5 +70,16 @@ internal object PendingUploadFlow {
             uploadedCount = uploadedCount ?: 0,
             shouldFinishSession = atSessionEnd,
         )
+    }
+
+    fun wifiSettingsAction(): PendingUploadActionDecision {
+        return PendingUploadActionDecision(
+            shouldOpenWifiSettings = true,
+            shouldPromptOnResume = true,
+        )
+    }
+
+    fun dismissAction(atSessionEnd: Boolean): PendingUploadActionDecision {
+        return PendingUploadActionDecision(shouldFinishSession = atSessionEnd)
     }
 }

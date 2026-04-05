@@ -32,7 +32,7 @@ data class OcrDisplayResult(
     val scoreMargin: Float?,
 )
 
-class PlateOcrEngine(context: Context) {
+class PlateOcrEngine(context: Context) : PlateOcrRecognizer {
     private val tag = "PlateOcrEngine"
     private val env = OrtEnvironment.getEnvironment()
     private val config = loadPlateConfig(context, "ocr/plate_config.yaml")
@@ -51,7 +51,7 @@ class PlateOcrEngine(context: Context) {
         plateOutputName = validation.plateOutputName
     }
 
-    fun recognize(
+    override fun recognize(
         cropPath: String,
         onResult: (OcrDisplayResult?) -> Unit,
     ) {
@@ -111,7 +111,7 @@ class PlateOcrEngine(context: Context) {
         }
     }
 
-    fun close() {
+    override fun close() {
         if (!isClosed.compareAndSet(false, true)) {
             return
         }

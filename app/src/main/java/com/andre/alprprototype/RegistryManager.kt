@@ -17,7 +17,7 @@ import java.util.*
 class RegistryManager(
     private val context: Context,
     private val apiFactory: (() -> RegistryApi)? = null,
-) {
+) : PlateRegistry {
     private val tag = "RegistryManager"
     private val gson = Gson()
     private val cacheFile = File(context.filesDir, "plate_registry.json")
@@ -67,7 +67,7 @@ class RegistryManager(
         }
     }
 
-    suspend fun syncRegistry(): Result<Int> = withContext(Dispatchers.IO) {
+    override suspend fun syncRegistry(): Result<Int> = withContext(Dispatchers.IO) {
         try {
             val plates = api.getRegistry(version = 0)
             
@@ -82,7 +82,7 @@ class RegistryManager(
         }
     }
 
-    fun isPlateValid(plateText: String): PlateValidationResult {
+    override fun isPlateValid(plateText: String): PlateValidationResult {
         val cleanPlate = plateText.uppercase().trim()
         val entry = registeredPlates[cleanPlate] ?: return PlateValidationResult.NOT_FOUND
 

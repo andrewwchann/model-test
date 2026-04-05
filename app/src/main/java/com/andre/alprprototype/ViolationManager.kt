@@ -19,7 +19,7 @@ import java.util.UUID
 class ViolationManager(
     private val context: Context,
     private val apiFactory: (() -> ViolationApi)? = null,
-) {
+) : ViolationQueue {
     private val tag = "ViolationManager"
     private val gson = Gson()
     private val queueFile = File(context.filesDir, "violation_queue.json")
@@ -93,7 +93,7 @@ class ViolationManager(
         }
     }
 
-    fun addViolation(violation: ViolationEvent): Result<ViolationEvent> {
+    override fun addViolation(violation: ViolationEvent): Result<ViolationEvent> {
         val stagedViolation = stageViolationAssets(violation)
             ?: return Result.failure(IllegalStateException("Failed to stage violation assets"))
         synchronized(queueLock) {
@@ -112,9 +112,9 @@ class ViolationManager(
         return Result.success(stagedViolation)
     }
 
-    fun getQueueSize(): Int = synchronized(queueLock) { queuedViolations.size }
+    override fun getQueueSize(): Int = synchronized(queueLock) { queuedViolations.size }
 
-    suspend fun uploadQueue(): Result<Int> = withContext(Dispatchers.IO) {
+    override suspend fun uploadQueue(): Result<Int> = withContext(Dispatchers.IO) {
         val queueSnapshot = synchronized(queueLock) { queuedViolations.toList() }
         if (queueSnapshot.isEmpty()) return@withContext Result.success(0)
 

@@ -32,6 +32,23 @@ class PendingUploadFlowTest {
     }
 
     @Test
+    fun promptDecision_captures_prompt_or_finish_behavior() {
+        val prompt = PendingUploadFlow.promptDecision(pendingCount = 2, atSessionEnd = true)
+        val finish = PendingUploadFlow.promptDecision(pendingCount = 0, atSessionEnd = true)
+        val resume = PendingUploadFlow.promptDecision(pendingCount = 0, atSessionEnd = false)
+
+        assertTrue(prompt.shouldShowPrompt)
+        assertFalse(prompt.shouldFinishSession)
+        assertEquals(R.string.pending_upload_before_closing_title, prompt.promptSpec?.titleRes)
+
+        assertFalse(finish.shouldShowPrompt)
+        assertTrue(finish.shouldFinishSession)
+
+        assertFalse(resume.shouldShowPrompt)
+        assertFalse(resume.shouldFinishSession)
+    }
+
+    @Test
     fun syncOutcome_keeps_finish_flag_and_normalizes_null_count() {
         val success = PendingUploadFlow.syncOutcome(true, 3, atSessionEnd = true)
         val failure = PendingUploadFlow.syncOutcome(false, null, atSessionEnd = false)
@@ -43,5 +60,18 @@ class PendingUploadFlowTest {
         assertFalse(failure.shouldShowSuccess)
         assertEquals(0, failure.uploadedCount)
         assertFalse(failure.shouldFinishSession)
+    }
+
+    @Test
+    fun actionDecisions_cover_wifi_and_dismiss_paths() {
+        val wifi = PendingUploadFlow.wifiSettingsAction()
+        val dismissEnd = PendingUploadFlow.dismissAction(atSessionEnd = true)
+        val dismissResume = PendingUploadFlow.dismissAction(atSessionEnd = false)
+
+        assertTrue(wifi.shouldOpenWifiSettings)
+        assertTrue(wifi.shouldPromptOnResume)
+
+        assertTrue(dismissEnd.shouldFinishSession)
+        assertFalse(dismissResume.shouldFinishSession)
     }
 }

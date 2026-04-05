@@ -1,7 +1,9 @@
 package com.andre.alprprototype
 
+import android.view.View
 import com.andre.alprprototype.session.CameraSessionPolicy
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -130,5 +132,37 @@ class CameraSessionPolicyTest {
                 canUseCamera = false,
             ),
         )
+    }
+
+    @Test
+    fun chromeDecision_maps_visibility_and_analyzer_actions() {
+        val visible = CameraSessionPolicy.chromeDecision(
+            operatorDialogVisible = false,
+            evidenceFlowActive = false,
+            isAnalyzerAttached = false,
+            canUseCamera = true,
+        )
+        val hidden = CameraSessionPolicy.chromeDecision(
+            operatorDialogVisible = true,
+            evidenceFlowActive = false,
+            isAnalyzerAttached = true,
+            canUseCamera = true,
+        )
+
+        assertEquals(View.VISIBLE, visible.topActionVisibility)
+        assertEquals(View.VISIBLE, visible.centerAssistVisibility)
+        assertEquals(View.VISIBLE, visible.guideVisibility)
+        assertEquals(View.VISIBLE, visible.debugOverlayVisibility)
+        assertFalse(visible.shouldClearDebugState)
+        assertTrue(visible.shouldAttachAnalyzer)
+        assertFalse(visible.shouldClearAnalyzer)
+
+        assertEquals(View.GONE, hidden.topActionVisibility)
+        assertEquals(View.GONE, hidden.centerAssistVisibility)
+        assertEquals(View.GONE, hidden.guideVisibility)
+        assertEquals(View.INVISIBLE, hidden.debugOverlayVisibility)
+        assertTrue(hidden.shouldClearDebugState)
+        assertFalse(hidden.shouldAttachAnalyzer)
+        assertTrue(hidden.shouldClearAnalyzer)
     }
 }

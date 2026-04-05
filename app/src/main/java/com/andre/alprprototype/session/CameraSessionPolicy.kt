@@ -1,5 +1,17 @@
 package com.andre.alprprototype.session
 
+import android.view.View
+
+internal data class SessionChromeDecision(
+    val topActionVisibility: Int,
+    val centerAssistVisibility: Int,
+    val guideVisibility: Int,
+    val debugOverlayVisibility: Int,
+    val shouldClearDebugState: Boolean,
+    val shouldAttachAnalyzer: Boolean,
+    val shouldClearAnalyzer: Boolean,
+)
+
 internal object CameraSessionPolicy {
     fun shouldRequestOcr(
         cropPath: String,
@@ -36,5 +48,31 @@ internal object CameraSessionPolicy {
         canUseCamera: Boolean,
     ): Boolean {
         return !isAnalyzerAttached && !operatorDialogVisible && !evidenceFlowActive && canUseCamera
+    }
+
+    fun chromeDecision(
+        operatorDialogVisible: Boolean,
+        evidenceFlowActive: Boolean,
+        isAnalyzerAttached: Boolean,
+        canUseCamera: Boolean,
+    ): SessionChromeDecision {
+        val showSessionChrome = shouldShowSessionChrome(
+            operatorDialogVisible = operatorDialogVisible,
+            evidenceFlowActive = evidenceFlowActive,
+        )
+        return SessionChromeDecision(
+            topActionVisibility = if (showSessionChrome) View.VISIBLE else View.GONE,
+            centerAssistVisibility = if (showSessionChrome) View.VISIBLE else View.GONE,
+            guideVisibility = if (showSessionChrome) View.VISIBLE else View.GONE,
+            debugOverlayVisibility = if (showSessionChrome) View.VISIBLE else View.INVISIBLE,
+            shouldClearDebugState = !showSessionChrome,
+            shouldAttachAnalyzer = showSessionChrome && shouldAttachAnalyzer(
+                isAnalyzerAttached = isAnalyzerAttached,
+                operatorDialogVisible = operatorDialogVisible,
+                evidenceFlowActive = evidenceFlowActive,
+                canUseCamera = canUseCamera,
+            ),
+            shouldClearAnalyzer = !showSessionChrome && isAnalyzerAttached,
+        )
     }
 }
