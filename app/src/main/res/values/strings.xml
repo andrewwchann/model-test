@@ -19,6 +19,9 @@
     <string name="session_debug_guide">Overlay colors: yellow = static scene candidate, cyan = filtered plate-like region, green = tracked region accepted for OCR. When a possible violation is found, review the crop, confirm or edit the extracted plate, then capture a full-vehicle evidence photo.</string>
     <string name="close_camera">Close camera</string>
     <string name="camera_permission_required">Camera permission is required to run a live ALPR session.</string>
+    <string name="center_capture_button">Capture Center Plate</string>
+    <string name="center_capture_confirm_button">Capture</string>
+    <string name="center_capture_prompt">Plate not detected. Use Capture Center Plate to grab a centered crop.</string>
     <string name="violation_found_title">Violation Found</string>
     <string name="manual_plate_entry_title">Manual Plate Entry</string>
     <string name="manual_plate_entry_message">Assisted OCR could not read the plate reliably. Enter the plate manually.</string>
