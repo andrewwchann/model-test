@@ -47,15 +47,12 @@ data class PipelineDebugState(
 )
 
 class AlprPipeline(
-    private val candidateGenerator: PlateCandidateGenerator = StaticSceneCandidateGenerator(),
+    private val candidateGenerator: PlateCandidateGenerator,
     private val candidateFilter: PlateCandidateFilter = PlateLikeCandidateFilter(),
     private val tracker: PlateTracker = SimplePlateTracker(),
-    private val qualityScorer: PlateQualityScorer = HeuristicPlateQualityScorer(),
+    private val qualityScorer: PlateQualityScorer = LivePlateQualityScorer(),
     private val scanEveryNFrames: Int = 4,
 ) : AutoCloseable {
-    val detectorName: String
-        get() = candidateGenerator.name
-
     private var lastTrackId: Int? = null
 
     fun process(
@@ -103,14 +100,11 @@ class AlprPipeline(
     companion object {
         fun create(context: Context): AlprPipeline {
             val candidateGenerator = YoloTflitePlateCandidateGenerator.createOrNull(context)
-                ?: StaticSceneCandidateGenerator()
-
-            // Middle ground: every 2nd frame while acquiring and every 4th frame when tracked.
-            val scanEveryNFrames = if (candidateGenerator is YoloTflitePlateCandidateGenerator) 4 else 6
+                ?: throw IllegalStateException("Required detector model could not be loaded")
             
             return AlprPipeline(
                 candidateGenerator = candidateGenerator,
-                scanEveryNFrames = scanEveryNFrames,
+                scanEveryNFrames = 4,
             )
         }
     }
@@ -135,197 +129,25 @@ interface PlateQualityScorer {
     fun score(image: ImageProxy, track: PlateTrack): PlateQuality
 }
 
-class StaticSceneCandidateGenerator : PlateCandidateGenerator {
-    override val name: String = "static-region-proposals"
-
-    override fun generate(image: ImageProxy, uprightBitmapProvider: (() -> Bitmap?)?): List<PlateCandidate> {
-        val plane = image.planes.firstOrNull() ?: return emptyList()
-        val frameWidth = image.width
-        val frameHeight = image.height
-        val data = plane.buffer.duplicate().apply { rewind() }
-        val rowStride = plane.rowStride
-        val pixelStride = plane.pixelStride
-        if (frameWidth <= 0 || frameHeight <= 0) return emptyList()
-
-        // Speed: Narrow the search area to the "sweet spot" (middle-bottom where plates usually are)
-        val searchTop = (frameHeight * 0.40f).toInt()
-        val searchBottom = (frameHeight * 0.80f).toInt()
-        val windowWidth = max(48, (frameWidth * 0.22f).toInt())
-        val windowHeight = max(18, (windowWidth / 4.4f).toInt())
-        
-        // Speed: Larger steps to cover area faster with fewer samples
-        val stepX = max(24, windowWidth / 2) 
-        val stepY = max(16, windowHeight / 2)
-
-        val proposals = mutableListOf<PlateCandidate>()
-
-        var top = searchTop
-        while (top + windowHeight < searchBottom) {
-            var left = (frameWidth * 0.1f).toInt() // Skip edges for speed
-            val rightLimit = (frameWidth * 0.9f).toInt()
-            while (left + windowWidth < rightLimit) {
-                val stats = sampleWindowStats(
-                    data = data,
-                    rowStride = rowStride,
-                    pixelStride = pixelStride,
-                    left = left,
-                    top = top,
-                    width = windowWidth,
-                    height = windowHeight,
-                )
-
-                // Reliability: Tighter thresholds to reject noise early
-                val edgePass = stats.horizontalEdgeDensity in 0.20f..0.75f
-                val contrastPass = stats.contrast in 25f..105f
-                val stripePass = stats.verticalStripeBalance in 0.20f..0.80f
-                val centerBias = centeredness(left.toFloat(), (left + windowWidth).toFloat(), frameWidth.toFloat())
-
-                if (edgePass && contrastPass && stripePass) {
-                    val confidence = (
-                        normalized(stats.horizontalEdgeDensity, 0.20f, 0.55f) * 0.45f +
-                        normalized(stats.contrast, 25f, 80f) * 0.30f +
-                        normalized(1f - abs(stats.verticalStripeBalance - 0.5f), 0.2f, 0.5f) * 0.15f +
-                        centerBias * 0.10f
-                    ).coerceIn(0f, 0.99f)
-
-                    proposals += PlateCandidate(
-                        boundingBox = RectF(
-                            left.toFloat(),
-                            top.toFloat(),
-                            (left + windowWidth).toFloat(),
-                            (top + windowHeight).toFloat(),
-                        ),
-                        confidence = confidence,
-                        source = "luma-grid",
-                    )
-                }
-
-                left += stepX
-            }
-            top += stepY
-        }
-
-        return proposals
-            .sortedByDescending { it.confidence }
-            .fold(mutableListOf<PlateCandidate>()) { accepted, candidate ->
-                if (accepted.none { overlaps(it.boundingBox, candidate.boundingBox) > 0.40f }) {
-                    accepted += candidate
-                }
-                accepted
-            }
-            .take(3) // Speed: Only look at top 3 candidates
-    }
-
-    private fun sampleWindowStats(
-        data: java.nio.ByteBuffer,
-        rowStride: Int,
-        pixelStride: Int,
-        left: Int,
-        top: Int,
-        width: Int,
-        height: Int,
-    ): WindowStats {
-        var sum = 0f
-        var sumSquares = 0f
-        var edgeHits = 0
-        var totalSamples = 0
-        var darkPixels = 0
-        var brightPixels = 0
-
-        // Speed Pillar: Sparse sampling. We don't need every pixel for stats.
-        val sampleStepX = max(4, width / 12)
-        val sampleStepY = max(3, height / 6)
-
-        var y = top
-        while (y < top + height - sampleStepY) {
-            var x = left
-            while (x < left + width - sampleStepX) {
-                val value = yValueAt(data, rowStride, pixelStride, x, y)
-                val right = yValueAt(data, rowStride, pixelStride, x + sampleStepX, y)
-                val down = yValueAt(data, rowStride, pixelStride, x, y + sampleStepY)
-                val diffX = abs(value - right)
-                val diffY = abs(value - down)
-
-                sum += value
-                sumSquares += value * value
-                if (diffX > 20f || diffY > 20f) edgeHits += 1
-                if (value < 90f) darkPixels += 1
-                if (value > 160f) brightPixels += 1
-                totalSamples += 1
-                x += sampleStepX
-            }
-            y += sampleStepY
-        }
-
-        if (totalSamples == 0) return WindowStats(0f, 0f, 0f)
-
-        val mean = sum / totalSamples
-        val variance = max(0f, (sumSquares / totalSamples) - mean * mean)
-        val contrast = kotlin.math.sqrt(variance)
-        val edgeDensity = edgeHits.toFloat() / totalSamples.toFloat()
-        val stripeBalance = min(darkPixels, brightPixels).toFloat() / max(darkPixels + brightPixels, 1).toFloat()
-
-        return WindowStats(
-            horizontalEdgeDensity = edgeDensity,
-            contrast = contrast,
-            verticalStripeBalance = stripeBalance,
-        )
-    }
-
-    private fun yValueAt(data: java.nio.ByteBuffer, rowStride: Int, pixelStride: Int, x: Int, y: Int): Float {
-        val index = y * rowStride + x * pixelStride
-        return (data.get(index).toInt() and 0xFF).toFloat()
-    }
-
-    private fun centeredness(left: Float, right: Float, frameWidth: Float): Float {
-        val centerX = (left + right) / 2f
-        val normalizedOffset = abs(centerX - frameWidth / 2f) / (frameWidth / 2f)
-        return 1f - normalizedOffset.coerceIn(0f, 1f)
-    }
-}
-
 class PlateLikeCandidateFilter : PlateCandidateFilter {
     override fun filter(candidates: List<PlateCandidate>, image: ImageProxy): List<PlateDetection> {
-        val minWidth = image.width * 0.12f
         val uprightFrameWidth = uprightFrameSize(image).first.toFloat()
         return candidates.mapNotNull { candidate ->
             val width = candidate.boundingBox.width()
             val height = candidate.boundingBox.height()
             val aspectRatio = width / max(height, 1f)
-            val centeredness = centeredness(
-                candidate.boundingBox,
-                if (candidate.source == "yolo-tflite") uprightFrameWidth else image.width.toFloat(),
-            )
-
-            if (candidate.source == "yolo-tflite") {
-                val yoloMinWidth = uprightFrameWidth * 0.07f
-                val aspectPass = aspectRatio in 1.4f..8.0f
-                val centeredPass = centeredness >= 0.01f
-                if (width < yoloMinWidth || !aspectPass || !centeredPass) {
-                    null
-                } else {
-                    PlateDetection(
-                        boundingBox = candidate.boundingBox,
-                        confidence = min(0.99f, candidate.confidence * 0.9f + 0.09f),
-                        source = candidate.source,
-                    )
-                }
+            val centeredness = centeredness(candidate.boundingBox, uprightFrameWidth)
+            val minWidth = uprightFrameWidth * 0.07f
+            val aspectPass = aspectRatio in 1.4f..8.0f
+            val centeredPass = centeredness >= 0.01f
+            if (width < minWidth || !aspectPass || !centeredPass) {
+                null
             } else {
-                val aspectPass = aspectRatio in 2.4f..6.4f
-                val sizePass = width >= minWidth
-                val centeredPass = centeredness >= 0.35f
-
-                if (!aspectPass || !sizePass || !centeredPass) {
-                    null
-                } else {
-                    val confidence = min(
-                        0.99f,
-                        candidate.confidence * 0.7f +
-                            normalized(aspectRatio, 2.4f, 4.8f) * 0.2f +
-                            centeredness * 0.1f,
-                    )
-                    PlateDetection(candidate.boundingBox, confidence, candidate.source)
-                }
+                PlateDetection(
+                    boundingBox = candidate.boundingBox,
+                    confidence = min(0.99f, candidate.confidence * 0.9f + 0.09f),
+                    source = candidate.source,
+                )
             }
         }
     }
@@ -380,14 +202,14 @@ class SimplePlateTracker : PlateTracker {
     }
 }
 
-class HeuristicPlateQualityScorer : PlateQualityScorer {
+class LivePlateQualityScorer : PlateQualityScorer {
     override fun score(image: ImageProxy, track: PlateTrack): PlateQuality {
         val plateWidth = track.boundingBox.width()
         val plateHeight = track.boundingBox.height()
         val uprightFrameWidth = uprightFrameSize(image).first.toFloat()
-        val frameWidth = if (track.source == "yolo-tflite") uprightFrameWidth else image.width.toFloat()
-        val minRequiredWidth = if (track.source == "yolo-tflite") frameWidth * 0.08f else frameWidth * 0.16f
-        val blurTargetWidth = if (track.source == "yolo-tflite") frameWidth * 0.18f else frameWidth * 0.28f
+        val frameWidth = uprightFrameWidth
+        val minRequiredWidth = frameWidth * 0.08f
+        val blurTargetWidth = frameWidth * 0.18f
         val blurScore = min(1f, plateWidth / blurTargetWidth)
         val targetAspect = 4.4f
         val actualAspect = plateWidth / max(plateHeight, 1f)
@@ -397,10 +219,10 @@ class HeuristicPlateQualityScorer : PlateQualityScorer {
         if (plateWidth < minRequiredWidth) {
             reasons += "tiny-box"
         }
-        if (blurScore < if (track.source == "yolo-tflite") 0.30f else 0.45f) {
+        if (blurScore < 0.30f) {
             reasons += "blur"
         }
-        if (angleScore < if (track.source == "yolo-tflite") 0.35f else 0.60f) {
+        if (angleScore < 0.35f) {
             reasons += "aspect-angle"
         }
 
@@ -416,18 +238,6 @@ class HeuristicPlateQualityScorer : PlateQualityScorer {
         )
     }
 }
-
-
-private fun normalized(value: Float, minValue: Float, maxValue: Float): Float {
-    if (maxValue <= minValue) return 0f
-    return ((value - minValue) / (maxValue - minValue)).coerceIn(0f, 1f)
-}
-
-private data class WindowStats(
-    val horizontalEdgeDensity: Float,
-    val contrast: Float,
-    val verticalStripeBalance: Float,
-)
 
 private fun overlaps(a: RectF, b: RectF): Float {
     val left = max(a.left, b.left)

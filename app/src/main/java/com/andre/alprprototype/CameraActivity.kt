@@ -80,8 +80,6 @@ class CameraActivity : AppCompatActivity() {
     private var latestOcrResult: OcrDisplayResult? = null
     private var latestOcrState: OcrUiState = OcrUiState.IDLE
     private var lastCropSource: CropSource = CropSource.AUTO
-    private var lastConfirmedPlateText: String? = null
-    private var lastConfirmedPlateAtMs: Long = 0L
     private lateinit var plateOcrEngine: PlateOcrEngine
     private var isGuideExpanded: Boolean = false
     private var hasPromptedPendingUploadSyncOnStart: Boolean = false
@@ -94,6 +92,7 @@ class CameraActivity : AppCompatActivity() {
     private val operatorDialogCount = AtomicInteger(0)
     private var isAnalyzerAttached = false
     private var isEvidenceFlowActive = false
+    private val confirmedPlateTracker = ConfirmedPlateTracker(CONFIRMED_PLATE_COOLDOWN_MS)
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -333,7 +332,7 @@ class CameraActivity : AppCompatActivity() {
             return
         }
         assistedPromptShown = true
-        showTopToast("Plate not detected. Use Capture Center Plate to grab a centered crop.")
+        showTopToast(getString(R.string.center_capture_prompt))
     }
 
     private fun handleCenterAssistButtonClick() {
@@ -397,25 +396,15 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun shouldEscalateAssistedCropToManual(result: OcrDisplayResult?): Boolean {
-        if (result == null) {
-            return true
-        }
-        if (result.text.isBlank()) {
-            return true
-        }
-        if (result.text.length < MIN_ASSISTED_TEXT_LENGTH) {
-            return true
-        }
-        if ((result.confidence ?: 0f) < MANUAL_ENTRY_CONFIDENCE_THRESHOLD) {
-            return true
-        }
-        if (result.variantCount > 1 && result.agreementCount < MIN_ASSISTED_OCR_AGREEMENT) {
-            return true
-        }
-        if (result.variantCount > 1 && (result.scoreMargin ?: 0f) < MIN_ASSISTED_SCORE_MARGIN) {
-            return true
-        }
-        return false
+        return AssistedOcrPolicy.shouldEscalateToManual(
+            result = result,
+            config = AssistedOcrPolicyConfig(
+                minTextLength = MIN_ASSISTED_TEXT_LENGTH,
+                minConfidence = MANUAL_ENTRY_CONFIDENCE_THRESHOLD,
+                minAgreement = MIN_ASSISTED_OCR_AGREEMENT,
+                minScoreMargin = MIN_ASSISTED_SCORE_MARGIN,
+            ),
+        )
     }
 
     private fun promptForManualPlateEntry(cropPath: String, suggestedText: String?) {
@@ -445,7 +434,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun handleManualPlateEntry(rawText: String, cropPath: String): Boolean {
-        val normalizedText = rawText.uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }
+        val normalizedText = PlateTextNormalizer.normalize(rawText)
         if (normalizedText.isBlank()) {
             return false
         }
@@ -571,7 +560,7 @@ class CameraActivity : AppCompatActivity() {
         cropPath: String,
         onPlateUpdated: ((String, RegistryManager.PlateValidationResult) -> Unit)? = null,
     ): RegistryManager.PlateValidationResult? {
-        val normalizedText = rawText.uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }
+        val normalizedText = PlateTextNormalizer.normalize(rawText)
         if (normalizedText.isBlank()) {
             return null
         }
@@ -711,7 +700,7 @@ class CameraActivity : AppCompatActivity() {
     private fun loadDisplayBitmap(imagePath: String): Bitmap? {
         val targetWidth = (resources.displayMetrics.widthPixels * 0.9f).toInt().coerceAtLeast(1)
         val targetHeight = (resources.displayMetrics.heightPixels * 0.6f).toInt().coerceAtLeast(1)
-        val bitmap = decodeSampledBitmap(imagePath, targetWidth, targetHeight) ?: return null
+        val bitmap = ImageSampling.decodeSampledBitmap(imagePath, targetWidth, targetHeight) ?: return null
         val rotationDegrees = try {
             when (ExifInterface(imagePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
                 ExifInterface.ORIENTATION_ROTATE_90 -> 90f
@@ -733,42 +722,6 @@ class CameraActivity : AppCompatActivity() {
             bitmap.recycle()
         }
         return rotatedBitmap
-    }
-
-    private fun decodeSampledBitmap(imagePath: String, targetWidth: Int, targetHeight: Int): Bitmap? {
-        val bounds = BitmapFactory.Options().apply {
-            inJustDecodeBounds = true
-        }
-        BitmapFactory.decodeFile(imagePath, bounds)
-
-        val sampleSize = calculateInSampleSize(bounds, targetWidth, targetHeight)
-        val decodeOptions = BitmapFactory.Options().apply {
-            inSampleSize = sampleSize
-            inPreferredConfig = Bitmap.Config.RGB_565
-        }
-        return BitmapFactory.decodeFile(imagePath, decodeOptions)
-    }
-
-    private fun calculateInSampleSize(
-        options: BitmapFactory.Options,
-        targetWidth: Int,
-        targetHeight: Int,
-    ): Int {
-        val imageHeight = options.outHeight
-        val imageWidth = options.outWidth
-        var sampleSize = 1
-
-        if (imageHeight <= 0 || imageWidth <= 0) {
-            return sampleSize
-        }
-
-        while ((imageHeight / (sampleSize * 2)) >= targetHeight &&
-            (imageWidth / (sampleSize * 2)) >= targetWidth
-        ) {
-            sampleSize *= 2
-        }
-
-        return sampleSize.coerceAtLeast(1)
     }
 
     private fun styleBottomDialog(dialog: AlertDialog) {
@@ -843,15 +796,7 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun buildPendingUploadPromptMessage(pendingCount: Int, atSessionEnd: Boolean): String {
-        val itemLabel = if (pendingCount == 1) "upload" else "uploads"
-        val presentVerb = if (pendingCount == 1) "is" else "are"
-        val pastVerb = if (pendingCount == 1) "was" else "were"
-        val syncHint = "Sync them now if the device is online, or keep them saved for the next session."
-        return if (atSessionEnd) {
-            "$pendingCount queued $itemLabel $presentVerb still saved on this device. $syncHint"
-        } else {
-            "$pendingCount queued $itemLabel $pastVerb saved from an earlier session. $syncHint"
-        }
+        return PendingUploadPromptFormatter.buildMessage(pendingCount, atSessionEnd)
     }
 
     private fun openWifiSettings() {
@@ -859,19 +804,8 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun shouldProcessConfirmedPlate(text: String): Boolean {
-        val normalizedText = text.uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }
-        if (normalizedText.isBlank()) {
-            return false
-        }
-        val nowMs = System.currentTimeMillis()
-        val isRepeatedPlate = normalizedText == lastConfirmedPlateText
-        val withinCooldown = nowMs - lastConfirmedPlateAtMs < CONFIRMED_PLATE_COOLDOWN_MS
-        if (isRepeatedPlate && withinCooldown) {
-            return false
-        }
-        lastConfirmedPlateText = normalizedText
-        lastConfirmedPlateAtMs = nowMs
-        return true
+        val normalizedText = PlateTextNormalizer.normalize(text)
+        return confirmedPlateTracker.shouldProcess(normalizedText)
     }
 
     private fun applyGuidePanelState() {
@@ -882,7 +816,10 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun updateSessionChromeVisibility() {
-        val showSessionChrome = !isOperatorDialogVisible() && !isEvidenceFlowActive
+        val showSessionChrome = SessionUiPolicy.shouldShowSessionChrome(
+            operatorDialogVisible = isOperatorDialogVisible(),
+            evidenceFlowActive = isEvidenceFlowActive,
+        )
         binding.topActionCard.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
         binding.centerAssistButton.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
         binding.guideCard.visibility = if (showSessionChrome) View.VISIBLE else View.GONE
@@ -947,7 +884,9 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun updateCenterAssistButton() {
-        binding.centerAssistButton.text = if (centerCaptureArmed) "Capture" else "Capture Center Plate"
+        binding.centerAssistButton.text = getString(
+            if (centerCaptureArmed) R.string.center_capture_confirm_button else R.string.center_capture_button,
+        )
     }
 
     private fun canUpdateUi(): Boolean {

@@ -17,7 +17,7 @@ data class AnalyzedFrame(
 )
 
 class PlateFrameAnalyzer(
-    private val pipeline: AlprPipeline = AlprPipeline(),
+    private val pipeline: AlprPipeline,
     private val cropSaver: BestPlateCropSaver,
     private val shouldAnalyze: () -> Boolean = { true },
     private val onFrameAnalyzed: (AnalyzedFrame) -> Unit,
