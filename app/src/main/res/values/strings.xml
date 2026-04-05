@@ -38,6 +38,7 @@
     <string name="registry_status_valid">Registry status: valid registration found</string>
     <string name="registry_status_expired">Registry status: registration expired</string>
     <string name="registry_status_not_found">Registry status: plate not found in registry</string>
+    <string name="plate_valid_message">Valid registration found: %1$s</string>
     <string name="evidence_dialog_title">Capture Vehicle Photo</string>
     <string name="evidence_dialog_message">Aim at the full vehicle, then capture when it is framed clearly.</string>
     <string name="evidence_dialog_cancel">Cancel</string>
