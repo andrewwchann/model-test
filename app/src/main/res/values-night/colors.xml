@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="surface">#121316</color>
+    <color name="card_surface">#1B1E22</color>
+    <color name="card_stroke">#394047</color>
+    <color name="crop_card_surface">#CC171A1E</color>
+    <color name="on_surface">#F1EFE9</color>
+    <color name="on_surface_muted">#B8B0A2</color>
+    <color name="primary">#5E8B84</color>
+    <color name="on_primary">#09110F</color>
+    <color name="secondary">#C99667</color>
+    <color name="dialog_button_sync">#FFD166</color>
+    <color name="dialog_button_wifi">#8ECAE6</color>
+    <color name="dialog_button_dismiss">#FF8A80</color>
+</resources>
