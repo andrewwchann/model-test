@@ -25,7 +25,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
-import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import com.google.android.material.color.MaterialColors
 import androidx.lifecycle.lifecycleScope
@@ -82,7 +81,7 @@ class CameraActivity : AppCompatActivity() {
     private lateinit var pipeline: AlprPipeline
     private lateinit var registryManager: PlateRegistry
     private lateinit var violationManager: ViolationQueue
-    private var cameraProvider: ProcessCameraProvider? = null
+    private var cameraProvider: CameraProviderSession? = null
     private var analysisUseCase: ImageAnalysis? = null
     private var imageCapture: ImageCapture? = null
     private var latestFrame: AnalyzedFrame? = null

@@ -8,12 +8,72 @@ import androidx.camera.core.ImageProxy
 import com.andre.alprprototype.BuildConfig
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.Tensor
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 
-class YoloTflitePlateCandidateGenerator private constructor(
+internal interface TfliteTensorInfo {
+    fun shape(): IntArray
+
+    fun dataType(): DataType
+}
+
+internal interface TfliteInterpreter : AutoCloseable {
+    fun getInputTensor(index: Int): TfliteTensorInfo
+
+    fun getOutputTensor(index: Int): TfliteTensorInfo
+
+    fun run(inputBuffer: ByteBuffer, outputBuffer: ByteBuffer)
+}
+
+internal class DefaultTfliteTensorInfo(
+    private val tensor: Tensor,
+) : TfliteTensorInfo {
+    override fun shape(): IntArray = tensor.shape()
+
+    override fun dataType(): DataType = tensor.dataType()
+}
+
+internal class DefaultTfliteInterpreter(
     private val interpreter: Interpreter,
+) : TfliteInterpreter {
+    override fun getInputTensor(index: Int): TfliteTensorInfo = DefaultTfliteTensorInfo(interpreter.getInputTensor(index))
+
+    override fun getOutputTensor(index: Int): TfliteTensorInfo = DefaultTfliteTensorInfo(interpreter.getOutputTensor(index))
+
+    override fun run(inputBuffer: ByteBuffer, outputBuffer: ByteBuffer) {
+        interpreter.run(inputBuffer, outputBuffer)
+    }
+
+    override fun close() {
+        interpreter.close()
+    }
+}
+
+internal object YoloTfliteGeneratorEnvironment {
+    var modelBufferLoader: (Context, String) -> ByteBuffer? = { context, assetPath -> defaultLoadModelBuffer(context, assetPath) }
+
+    var interpreterFactory: (ByteBuffer) -> TfliteInterpreter = { modelBuffer ->
+        val options = Interpreter.Options().apply {
+            setNumThreads(2)
+        }
+        DefaultTfliteInterpreter(Interpreter(modelBuffer, options))
+    }
+
+    fun reset() {
+        modelBufferLoader = { context, assetPath -> defaultLoadModelBuffer(context, assetPath) }
+        interpreterFactory = { modelBuffer ->
+            val options = Interpreter.Options().apply {
+                setNumThreads(2)
+            }
+            DefaultTfliteInterpreter(Interpreter(modelBuffer, options))
+        }
+    }
+}
+
+class YoloTflitePlateCandidateGenerator internal constructor(
+    private val interpreter: TfliteInterpreter,
     private val inputWidth: Int,
     private val inputHeight: Int,
     private val inputDataType: DataType,
@@ -113,11 +173,8 @@ class YoloTflitePlateCandidateGenerator private constructor(
         private const val MODEL_ASSET_PATH = "models/license_plate_detector.tflite"
 
         fun createOrNull(context: Context): YoloTflitePlateCandidateGenerator? {
-            val modelBuffer = loadModelBuffer(context, MODEL_ASSET_PATH) ?: return null
-            val options = Interpreter.Options().apply {
-                setNumThreads(2)
-            }
-            val interpreter = Interpreter(modelBuffer, options)
+            val modelBuffer = YoloTfliteGeneratorEnvironment.modelBufferLoader(context, MODEL_ASSET_PATH) ?: return null
+            val interpreter = YoloTfliteGeneratorEnvironment.interpreterFactory(modelBuffer)
             val inputShape = interpreter.getInputTensor(0).shape()
             val inputType = interpreter.getInputTensor(0).dataType()
             val dimensions = YoloTfliteModelLoader.interpretInputDimensions(inputShape)
@@ -134,23 +191,6 @@ class YoloTflitePlateCandidateGenerator private constructor(
                 inputDataType = inputType,
             )
         }
-
-        private fun loadModelBuffer(context: Context, assetPath: String): ByteBuffer? {
-            return YoloTfliteModelLoader.loadModelBuffer(
-                mapAssetBuffer = {
-                    context.assets.openFd(assetPath).use { descriptor ->
-                        descriptor.createInputStream().channel.map(
-                            FileChannel.MapMode.READ_ONLY,
-                            descriptor.startOffset,
-                            descriptor.declaredLength,
-                        )
-                    }
-                },
-                readAssetBytes = {
-                    context.assets.open(assetPath).use { it.readBytes() }
-                },
-            )
-        }
     }
 }
 
@@ -158,3 +198,20 @@ data class BitmapDetection(
     val boundingBox: RectF,
     val confidence: Float,
 )
+
+private fun defaultLoadModelBuffer(context: Context, assetPath: String): ByteBuffer? {
+    return YoloTfliteModelLoader.loadModelBuffer(
+        mapAssetBuffer = {
+            context.assets.openFd(assetPath).use { descriptor ->
+                descriptor.createInputStream().channel.map(
+                    FileChannel.MapMode.READ_ONLY,
+                    descriptor.startOffset,
+                    descriptor.declaredLength,
+                )
+            }
+        },
+        readAssetBytes = {
+            context.assets.open(assetPath).use { it.readBytes() }
+        },
+    )
+}

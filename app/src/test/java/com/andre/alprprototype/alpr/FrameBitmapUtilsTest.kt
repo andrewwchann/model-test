@@ -8,6 +8,7 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.impl.TagBundle
 import androidx.camera.core.impl.utils.ExifData
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith

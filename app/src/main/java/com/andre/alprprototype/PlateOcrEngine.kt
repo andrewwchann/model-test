@@ -18,7 +18,6 @@ import com.andre.alprprototype.ocr.PreparedInput
 import com.andre.alprprototype.ocr.ScoredOcrCandidate
 import java.io.File
 import java.nio.ByteBuffer
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -32,15 +31,136 @@ data class OcrDisplayResult(
     val scoreMargin: Float?,
 )
 
-class PlateOcrEngine(context: Context) : PlateOcrRecognizer {
+internal interface OcrExecutor {
+    fun execute(task: () -> Unit)
+
+    fun shutdownNow()
+
+    fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean
+}
+
+internal interface OcrTensor : AutoCloseable
+
+internal interface OcrOutput {
+    fun value(name: String): Any?
+}
+
+internal data class OcrValueInfo(
+    val isTensor: Boolean,
+)
+
+internal interface OcrSession : AutoCloseable {
+    fun inputInfo(): Map<String, OcrValueInfo>
+
+    fun outputInfo(): Map<String, OcrValueInfo>
+
+    fun run(inputName: String, tensor: OcrTensor): OcrOutput
+}
+
+internal interface OcrRuntime {
+    fun createTensor(buffer: ByteBuffer, shape: LongArray): OcrTensor
+}
+
+internal class ExecutorServiceOcrExecutor(
+    private val executor: java.util.concurrent.ExecutorService,
+) : OcrExecutor {
+    override fun execute(task: () -> Unit) {
+        executor.execute(task)
+    }
+
+    override fun shutdownNow() {
+        executor.shutdownNow()
+    }
+
+    override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean = executor.awaitTermination(timeout, unit)
+}
+
+internal class OrtOcrTensor(
+    private val tensor: OnnxTensor,
+) : OcrTensor {
+    override fun close() {
+        tensor.close()
+    }
+
+    internal fun raw(): OnnxTensor = tensor
+}
+
+internal class OrtOcrOutput(
+    private val output: OrtSession.Result,
+) : OcrOutput, AutoCloseable {
+    override fun value(name: String): Any? = output.get(name).orElse(null)?.value
+
+    override fun close() {
+        output.close()
+    }
+}
+
+internal class OrtOcrSession(
+    private val session: OrtSession,
+) : OcrSession {
+    override fun inputInfo(): Map<String, OcrValueInfo> = session.inputInfo.mapValues { (_, value) ->
+        OcrValueInfo(isTensor = value.info is TensorInfo)
+    }
+
+    override fun outputInfo(): Map<String, OcrValueInfo> = session.outputInfo.mapValues { (_, value) ->
+        OcrValueInfo(isTensor = value.info is TensorInfo)
+    }
+
+    override fun run(inputName: String, tensor: OcrTensor): OcrOutput {
+        val ortTensor = tensor as? OrtOcrTensor ?: error("Unexpected tensor type: ${tensor::class.java.name}")
+        return OrtOcrOutput(session.run(mapOf(inputName to ortTensor.raw())))
+    }
+
+    override fun close() {
+        session.close()
+    }
+}
+
+internal class OrtOcrRuntime(
+    private val env: OrtEnvironment = OrtEnvironment.getEnvironment(),
+) : OcrRuntime {
+    override fun createTensor(buffer: ByteBuffer, shape: LongArray): OcrTensor =
+        OrtOcrTensor(OnnxTensor.createTensor(env, buffer, shape, OnnxJavaType.UINT8))
+}
+
+internal object PlateOcrEnvironment {
+    var configLoader: (Context) -> PlateConfig = { context -> loadPlateConfig(context, "ocr/plate_config.yaml") }
+
+    var sessionFactory: (Context) -> OcrSession = { context ->
+        val session = OrtEnvironment.getEnvironment().createSession(
+            copyAssetToCache(context, "ocr/plate_ocr.onnx").absolutePath,
+            OrtSession.SessionOptions(),
+        )
+        OrtOcrSession(session)
+    }
+
+    var runtimeFactory: () -> OcrRuntime = { OrtOcrRuntime() }
+
+    var executorFactory: () -> OcrExecutor = {
+        ExecutorServiceOcrExecutor(Executors.newSingleThreadExecutor())
+    }
+
+    fun reset() {
+        configLoader = { context -> loadPlateConfig(context, "ocr/plate_config.yaml") }
+        sessionFactory = { context ->
+            val session = OrtEnvironment.getEnvironment().createSession(
+                copyAssetToCache(context, "ocr/plate_ocr.onnx").absolutePath,
+                OrtSession.SessionOptions(),
+            )
+            OrtOcrSession(session)
+        }
+        runtimeFactory = { OrtOcrRuntime() }
+        executorFactory = { ExecutorServiceOcrExecutor(Executors.newSingleThreadExecutor()) }
+    }
+}
+
+class PlateOcrEngine internal constructor(
+    private val config: PlateConfig,
+    private val runtime: OcrRuntime,
+    private val session: OcrSession,
+    private val executor: OcrExecutor,
+) : PlateOcrRecognizer {
     private val tag = "PlateOcrEngine"
-    private val env = OrtEnvironment.getEnvironment()
-    private val config = loadPlateConfig(context, "ocr/plate_config.yaml")
-    private val session = env.createSession(
-        copyAssetToCache(context, "ocr/plate_ocr.onnx").absolutePath,
-        OrtSession.SessionOptions(),
-    )
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val isClosed = AtomicBoolean(false)
     private val inputName: String
     private val plateOutputName: String
@@ -50,6 +170,13 @@ class PlateOcrEngine(context: Context) : PlateOcrRecognizer {
         inputName = validation.inputName
         plateOutputName = validation.plateOutputName
     }
+
+    constructor(context: Context) : this(
+        config = PlateOcrEnvironment.configLoader(context),
+        runtime = PlateOcrEnvironment.runtimeFactory(),
+        session = PlateOcrEnvironment.sessionFactory(context),
+        executor = PlateOcrEnvironment.executorFactory(),
+    )
 
     override fun recognize(
         cropPath: String,
@@ -122,15 +249,14 @@ class PlateOcrEngine(context: Context) : PlateOcrRecognizer {
 
     private fun runInference(bitmap: Bitmap, sourcePath: String): ScoredOcrCandidate? {
         val prepared = preprocess(bitmap)
-        val tensor = OnnxTensor.createTensor(env, prepared.buffer, prepared.shape, OnnxJavaType.UINT8)
-        tensor.use { inputTensor ->
-            session.run(mapOf(inputName to inputTensor)).use { output ->
-                val plateValue = output.get(plateOutputName).orElse(null)
-                val logits = extractPlateLogits(plateValue?.value) ?: return null
+        runtime.createTensor(prepared.buffer, prepared.shape).use { inputTensor ->
+            val output = session.run(inputName, inputTensor)
+            (output as? AutoCloseable).use {
+                val logits = extractPlateLogits(output.value(plateOutputName)) ?: return null
                 val decoded = decodeFixedSlots(logits)
                 val finalText = normalizePlateText(decoded.rawText)
                 if (finalText.isBlank()) return null
-                
+
                 return ScoredOcrCandidate(
                     text = finalText,
                     score = scoreCandidate(finalText, decoded.averageConfidence),
@@ -151,10 +277,14 @@ class PlateOcrEngine(context: Context) : PlateOcrRecognizer {
     private fun scoreCandidate(text: String, averageConfidence: Float): Float = PlateOcrMath.scoreCandidate(text, averageConfidence)
 
     private fun validateModelContract(): ModelValidation {
-        val inputEntry = session.inputInfo.entries.firstOrNull() ?: throw IllegalStateException("OCR model has no inputs")
-        val inputTensor = inputEntry.value.info as? TensorInfo ?: throw IllegalStateException("OCR model input is not a tensor")
-        val plateEntry = session.outputInfo["plate"] ?: throw IllegalStateException("OCR model missing 'plate' output")
-        val plateTensor = plateEntry.info as? TensorInfo ?: throw IllegalStateException("OCR model 'plate' output is not a tensor")
+        val inputEntry = session.inputInfo().entries.firstOrNull() ?: throw IllegalStateException("OCR model has no inputs")
+        if (!inputEntry.value.isTensor) {
+            throw IllegalStateException("OCR model input is not a tensor")
+        }
+        val plateEntry = session.outputInfo()["plate"] ?: throw IllegalStateException("OCR model missing 'plate' output")
+        if (!plateEntry.isTensor) {
+            throw IllegalStateException("OCR model 'plate' output is not a tensor")
+        }
 
         return ModelValidation(
             inputName = inputEntry.key,

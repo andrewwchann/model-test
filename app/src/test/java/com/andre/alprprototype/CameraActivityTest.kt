@@ -277,6 +277,55 @@ class CameraActivityTest {
     }
 
     @Test
+    fun handleManualPlateEntry_prompts_violation_for_unknown_plate() {
+        val activity = buildActivity().get()
+
+        val accepted = ReflectionHelpers.callInstanceMethod<Boolean>(
+            activity,
+            "handleManualPlateEntry",
+            ClassParameter.from(String::class.java, "bad123"),
+            ClassParameter.from(String::class.java, "missing.jpg"),
+        )
+
+        val dialog = ShadowDialog.getLatestDialog()
+        assertTrue(accepted)
+        assertNotNull(dialog.findViewById<View>(R.id.violationCaptureButton))
+    }
+
+    @Test
+    fun handleManualPlateEntry_ignores_recently_confirmed_plate_without_toast() {
+        val activity = buildActivity(
+            registeredPlates = listOf(
+                RegistryPlate(
+                    plateString = "ABC123",
+                    permitType = "A",
+                    expiryDate = "2099-12-31T23:59:59.000Z",
+                    lotZone = "Z1",
+                    listVersion = 1,
+                ),
+            ),
+        ).get()
+
+        ReflectionHelpers.callInstanceMethod<Boolean>(
+            activity,
+            "handleManualPlateEntry",
+            ClassParameter.from(String::class.java, "ABC123"),
+            ClassParameter.from(String::class.java, "crop-a.jpg"),
+        )
+        ShadowToast.reset()
+
+        val accepted = ReflectionHelpers.callInstanceMethod<Boolean>(
+            activity,
+            "handleManualPlateEntry",
+            ClassParameter.from(String::class.java, "ABC123"),
+            ClassParameter.from(String::class.java, "crop-b.jpg"),
+        )
+
+        assertTrue(accepted)
+        assertNull(ShadowToast.getLatestToast())
+    }
+
+    @Test
     fun handleViolationPlateEdit_returns_null_for_blank_text() {
         val activity = buildActivity().get()
 
@@ -320,6 +369,34 @@ class CameraActivityTest {
         assertEquals(RegistryManager.PlateValidationResult.VALID, validation)
         assertFalse(evidenceFlowState.isActive)
         assertEquals(activity.getString(R.string.plate_corrected_valid_message), ShadowToast.getTextOfLatestToast())
+    }
+
+    @Test
+    fun handleViolationPlateEdit_invokes_callback_for_non_valid_plate_without_finishing_flow() {
+        val activity = buildActivity().get()
+        val evidenceFlowState = ReflectionHelpers.getField<EvidenceFlowState>(activity, "evidenceFlowState")
+        evidenceFlowState.beginViolationReview()
+        var callbackPlate: String? = null
+        var callbackValidation: RegistryManager.PlateValidationResult? = null
+
+        val validation = ReflectionHelpers.callInstanceMethod<RegistryManager.PlateValidationResult>(
+            activity,
+            "handleViolationPlateEdit",
+            ClassParameter.from(String::class.java, "bad123"),
+            ClassParameter.from(Float::class.javaPrimitiveType!!, 0.8f),
+            ClassParameter.from(String::class.java, "crop.jpg"),
+            ClassParameter.from(Function2::class.java, { plate: String, result: RegistryManager.PlateValidationResult ->
+                callbackPlate = plate
+                callbackValidation = result
+                Unit
+            }),
+        )
+
+        assertEquals(RegistryManager.PlateValidationResult.NOT_FOUND, validation)
+        assertEquals("BAD123", callbackPlate)
+        assertEquals(RegistryManager.PlateValidationResult.NOT_FOUND, callbackValidation)
+        assertTrue(evidenceFlowState.isActive)
+        assertNull(ShadowToast.getLatestToast())
     }
 
     @Test
@@ -627,6 +704,26 @@ class CameraActivityTest {
     }
 
     @Test
+    fun queueViolation_shows_failure_toast_when_add_fails() {
+        val activity = buildActivity(
+            addViolationResult = Result.failure(IllegalStateException("queue failed")),
+        ).get()
+        val binding = ReflectionHelpers.getField<ActivityCameraBinding>(activity, "binding")
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "queueViolation",
+            ClassParameter.from(String::class.java, "BAD123"),
+            ClassParameter.from(Float::class.javaPrimitiveType!!, 0.6f),
+            ClassParameter.from(String::class.java, "plate.jpg"),
+            ClassParameter.from(String::class.java, "vehicle.jpg"),
+        )
+
+        assertEquals(activity.getString(R.string.violation_queue_failed_message), ShadowToast.getTextOfLatestToast())
+        assertEquals(activity.getString(R.string.upload_queue_button_format, 0), binding.uploadQueueButton.text.toString())
+    }
+
+    @Test
     fun confirmVehiclePhoto_retake_deletes_photo_and_reopens_capture_prompt() {
         val activity = buildActivity().get()
         val vehicleFile = createImageFile(activity.cacheDir, "vehicle")
@@ -758,6 +855,45 @@ class CameraActivityTest {
 
         assertEquals(activity.getString(R.string.pending_upload_synced_message, 1), ShadowToast.getTextOfLatestToast())
         assertTrue(activity.isFinishing)
+    }
+
+    @Test
+    fun stylePendingUploadDialog_colors_buttons_when_present() {
+        val activity = buildActivity(
+            queuedViolations = mutableListOf(
+                ViolationEvent(
+                    rawOcrText = "ABC123",
+                    confidenceScore = 0.9f,
+                    timestamp = "2026-04-05T00:00:00Z",
+                    operatorId = "Device_01",
+                    localVehiclePath = "vehicle.jpg",
+                    localPlatePath = "plate.jpg",
+                ),
+            ),
+        ).get()
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "showPendingUploadSyncPrompt",
+            ClassParameter.from(Boolean::class.javaPrimitiveType!!, false),
+        )
+
+        val dialog = ShadowDialog.getLatestDialog() as androidx.appcompat.app.AlertDialog
+        assertEquals(activity.getColor(R.color.dialog_button_sync), dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE).currentTextColor)
+        assertEquals(activity.getColor(R.color.dialog_button_wifi), dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEUTRAL).currentTextColor)
+        assertEquals(activity.getColor(R.color.dialog_button_dismiss), dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE).currentTextColor)
+    }
+
+    @Test
+    fun stylePendingUploadDialog_handles_missing_buttons() {
+        val activity = buildActivity().get()
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(activity).create()
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "stylePendingUploadDialog",
+            ClassParameter.from(androidx.appcompat.app.AlertDialog::class.java, dialog),
+        )
     }
 
     @Test
@@ -919,6 +1055,37 @@ class CameraActivityTest {
 
         val dialog = ShadowDialog.getLatestDialog()
         assertNotNull(dialog.findViewById<View>(R.id.violationCaptureButton))
+    }
+
+    @Test
+    fun loadViolationCropImage_sets_bitmap_when_file_exists() {
+        val activity = buildActivity().get()
+        val imageView = android.widget.ImageView(activity)
+        val file = createImageFile(activity.cacheDir, "violation-crop")
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "loadViolationCropImage",
+            ClassParameter.from(android.widget.ImageView::class.java, imageView),
+            ClassParameter.from(String::class.java, file.absolutePath),
+        )
+
+        assertNotNull((imageView.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap)
+    }
+
+    @Test
+    fun loadViolationCropImage_sets_placeholder_when_file_is_missing() {
+        val activity = buildActivity().get()
+        val imageView = android.widget.ImageView(activity)
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "loadViolationCropImage",
+            ClassParameter.from(android.widget.ImageView::class.java, imageView),
+            ClassParameter.from(String::class.java, "does-not-exist.jpg"),
+        )
+
+        assertNotNull(imageView.drawable)
     }
 
     @Test
@@ -1098,6 +1265,7 @@ class CameraActivityTest {
     private fun buildActivity(
         registeredPlates: List<RegistryPlate> = emptyList(),
         queuedViolations: MutableList<ViolationEvent> = mutableListOf(),
+        addViolationResult: Result<ViolationEvent>? = null,
         syncRegistryResult: Result<Int> = Result.success(0),
         uploadQueueResult: Result<Int> = Result.success(0),
         plateOcrRecognizer: PlateOcrRecognizer = FakePlateOcrRecognizer(),
@@ -1133,6 +1301,7 @@ class CameraActivityTest {
         CameraActivityDependencies.violationManagerFactory = {
             object : ViolationQueue {
                 override fun addViolation(violation: ViolationEvent): Result<ViolationEvent> {
+                    addViolationResult?.let { return it }
                     queuedViolations += violation
                     violation.localPlatePath?.let { File(it).delete() }
                     violation.localVehiclePath?.let { File(it).delete() }

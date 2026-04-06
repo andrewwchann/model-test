@@ -37,6 +37,22 @@ class YoloTfliteMathTest {
     }
 
     @Test
+    fun preprocess_builds_uint8_buffer() {
+        val bitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply {
+            setPixel(0, 0, android.graphics.Color.rgb(12, 34, 56))
+        }
+
+        val frame = YoloTfliteMath.preprocess(bitmap, 1, 1, DataType.UINT8)
+        val bytes = ByteArray(3)
+        frame.inputBuffer.get(bytes)
+
+        assertEquals(3, frame.inputBuffer.capacity())
+        assertEquals(12.toByte(), bytes[0])
+        assertEquals(34.toByte(), bytes[1])
+        assertEquals(56.toByte(), bytes[2])
+    }
+
+    @Test
     fun decodeDetections_reads_channels_first_and_applies_nms() {
         val values = floatArrayOf(
             0.5f, 0.52f, 0.8f, 0.1f, 0.1f,
@@ -94,6 +110,57 @@ class YoloTfliteMathTest {
         val detections = YoloTfliteMath.decodeDetections(floatArrayOf(1f, 2f, 3f, 4f), intArrayOf(1, 2, 2))
 
         assertTrue(detections.isEmpty())
+    }
+
+    @Test
+    fun decodeDetections_filters_low_confidence_boxes() {
+        val values = floatArrayOf(
+            0.5f, 0.2f,
+            0.5f, 0.2f,
+            0.3f, 0.1f,
+            0.2f, 0.1f,
+            0.34f, 0.1f,
+        )
+
+        val detections = YoloTfliteMath.decodeDetections(values, intArrayOf(1, 5, 2))
+
+        assertTrue(detections.isEmpty())
+    }
+
+    @Test
+    fun decodeDetections_uses_max_score_when_values_are_not_probabilities() {
+        val values = floatArrayOf(
+            20f, 10f, 8f, 4f, 2.5f, 1.2f, 1.8f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f,
+        )
+
+        val detections = YoloTfliteMath.decodeDetections(values, intArrayOf(1, 8, 7))
+
+        assertEquals(1, detections.size)
+        assertEquals(2.5f, detections.first().confidence, 0.0001f)
+    }
+
+    @Test
+    fun decodeDetections_limits_results_to_max_detections() {
+        val values = floatArrayOf(
+            0.05f, 0.15f, 0.25f, 0.35f, 0.45f, 0.55f, 0.65f,
+            0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f,
+            0.05f, 0.05f, 0.05f, 0.05f, 0.05f, 0.05f, 0.05f,
+            0.05f, 0.05f, 0.05f, 0.05f, 0.05f, 0.05f, 0.05f,
+            0.95f, 0.9f, 0.85f, 0.8f, 0.75f, 0.7f, 0.65f,
+        )
+
+        val detections = YoloTfliteMath.decodeDetections(values, intArrayOf(1, 5, 7))
+
+        assertEquals(6, detections.size)
+        assertEquals(0.95f, detections.first().confidence, 0.0001f)
+        assertEquals(0.55f, detections.last().cx, 0.0001f)
     }
 
     @Test

@@ -5,6 +5,26 @@ import androidx.camera.core.ImageCaptureException
 import java.io.File
 import java.util.concurrent.Executor
 
+internal interface VehiclePhotoCaptureInvoker {
+    fun takePicture(
+        imageCapture: ImageCapture,
+        outputOptions: ImageCapture.OutputFileOptions,
+        executor: Executor,
+        callback: ImageCapture.OnImageSavedCallback,
+    )
+}
+
+internal object DefaultVehiclePhotoCaptureInvoker : VehiclePhotoCaptureInvoker {
+    override fun takePicture(
+        imageCapture: ImageCapture,
+        outputOptions: ImageCapture.OutputFileOptions,
+        executor: Executor,
+        callback: ImageCapture.OnImageSavedCallback,
+    ) {
+        imageCapture.takePicture(outputOptions, executor, callback)
+    }
+}
+
 internal interface VehiclePhotoCaptureExecutor {
     fun capture(
         imageCapture: ImageCapture,
@@ -16,6 +36,8 @@ internal interface VehiclePhotoCaptureExecutor {
 }
 
 internal object DefaultVehiclePhotoCaptureExecutor : VehiclePhotoCaptureExecutor {
+    internal var invoker: VehiclePhotoCaptureInvoker = DefaultVehiclePhotoCaptureInvoker
+
     override fun capture(
         imageCapture: ImageCapture,
         photoFile: File,
@@ -24,10 +46,11 @@ internal object DefaultVehiclePhotoCaptureExecutor : VehiclePhotoCaptureExecutor
         onError: (ImageCaptureException) -> Unit,
     ) {
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
-        imageCapture.takePicture(
-            outputOptions,
-            executor,
-            object : ImageCapture.OnImageSavedCallback {
+        invoker.takePicture(
+            imageCapture = imageCapture,
+            outputOptions = outputOptions,
+            executor = executor,
+            callback = object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                     onSaved()
                 }
