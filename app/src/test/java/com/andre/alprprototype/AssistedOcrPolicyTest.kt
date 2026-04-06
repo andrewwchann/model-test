@@ -50,6 +50,16 @@ class AssistedOcrPolicyTest {
     }
 
     @Test
+    fun shouldEscalate_when_confidence_is_missing() {
+        assertTrue(
+            AssistedOcrPolicy.shouldEscalateToManual(
+                result = ocrResult(text = "ABC123", confidence = null),
+                config = config,
+            ),
+        )
+    }
+
+    @Test
     fun shouldEscalate_when_multi_variant_agreement_is_too_low() {
         assertTrue(
             AssistedOcrPolicy.shouldEscalateToManual(
@@ -64,6 +74,16 @@ class AssistedOcrPolicyTest {
         assertTrue(
             AssistedOcrPolicy.shouldEscalateToManual(
                 result = ocrResult(text = "ABC123", agreementCount = 2, variantCount = 2, scoreMargin = 0.07f),
+                config = config,
+            ),
+        )
+    }
+
+    @Test
+    fun shouldEscalate_when_multi_variant_margin_is_missing() {
+        assertTrue(
+            AssistedOcrPolicy.shouldEscalateToManual(
+                result = ocrResult(text = "ABC123", agreementCount = 2, variantCount = 2, scoreMargin = null),
                 config = config,
             ),
         )

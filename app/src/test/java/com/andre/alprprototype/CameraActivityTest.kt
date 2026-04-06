@@ -1058,6 +1058,76 @@ class CameraActivityTest {
     }
 
     @Test
+    fun requestOcrIfNeeded_ignores_duplicate_crop_requests() {
+        val recognizer = FakePlateOcrRecognizer()
+        val activity = buildActivity(plateOcrRecognizer = recognizer).get()
+        ReflectionHelpers.setField(activity, "lastOcrRequestedPath", "crop.jpg")
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "requestOcrIfNeeded",
+            ClassParameter.from(String::class.java, "crop.jpg"),
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertNull(recognizer.lastCropPath)
+    }
+
+    @Test
+    fun requestOcrIfNeeded_prompts_manual_entry_for_ambiguous_assisted_result() {
+        val recognizer = FakePlateOcrRecognizer()
+        val activity = buildActivity(plateOcrRecognizer = recognizer).get()
+        ReflectionHelpers.setField(activity, "lastCropSource", enumValue<Any>("com.andre.alprprototype.CameraActivity\$CropSource", "ASSISTED"))
+        ReflectionHelpers.setField(activity, "centerCaptureArmed", true)
+        recognizer.nextResult = OcrDisplayResult(
+            text = "ABC123",
+            sourcePath = "crop.jpg",
+            confidence = 0.5f,
+            agreementCount = 1,
+            variantCount = 2,
+            scoreMargin = 0.01f,
+        )
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "requestOcrIfNeeded",
+            ClassParameter.from(String::class.java, "crop.jpg"),
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val dialog = ShadowDialog.getLatestDialog() as androidx.appcompat.app.AlertDialog
+        assertNotNull(requireView(dialog.window!!.decorView, EditText::class.java))
+        assertFalse(ReflectionHelpers.getField(activity, "centerCaptureArmed"))
+    }
+
+    @Test
+    fun requestOcrIfNeeded_marks_blank_results_unavailable() {
+        val recognizer = FakePlateOcrRecognizer()
+        val activity = buildActivity(plateOcrRecognizer = recognizer).get()
+        recognizer.nextResult = OcrDisplayResult(
+            text = "",
+            sourcePath = "crop.jpg",
+            confidence = 0.1f,
+            agreementCount = 0,
+            variantCount = 1,
+            scoreMargin = null,
+        )
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            activity,
+            "requestOcrIfNeeded",
+            ClassParameter.from(String::class.java, "crop.jpg"),
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(
+            "UNAVAILABLE",
+            ReflectionHelpers.getField<Any>(activity, "latestOcrState").toString(),
+        )
+        assertNull(ShadowToast.getLatestToast())
+    }
+
+    @Test
     fun loadViolationCropImage_sets_bitmap_when_file_exists() {
         val activity = buildActivity().get()
         val imageView = android.widget.ImageView(activity)
@@ -1364,6 +1434,11 @@ class CameraActivityTest {
             }
         }
         throw AssertionError("Expected view of type ${type.simpleName}")
+    }
+
+    private fun <T> enumValue(className: String, constantName: String): T {
+        @Suppress("UNCHECKED_CAST")
+        return java.lang.Enum.valueOf(Class.forName(className) as Class<out Enum<*>>, constantName) as T
     }
 
     private fun <T : View> findView(root: View, type: Class<T>): T? {

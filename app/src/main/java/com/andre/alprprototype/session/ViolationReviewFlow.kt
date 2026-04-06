@@ -149,10 +149,13 @@ internal object ViolationReviewFlow {
             shouldProcessConfirmedPlate = { true },
             validator = validator,
         )
+        val validation = requireNotNull(recognition.validationResult) {
+            "Non-blank violation plate edit should always produce a validation result"
+        }
         return ViolationPlateEditDecision(
-            accepted = recognition.validationResult != null,
+            accepted = true,
             ocrResult = ocrResult,
-            validation = recognition.validationResult,
+            validation = validation,
             normalizedText = recognition.normalizedText,
         )
     }

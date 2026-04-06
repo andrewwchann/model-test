@@ -44,4 +44,16 @@ class SessionOperationFlowTest {
         assertEquals("boom", failure.formatArg)
         assertTrue(failure.longMessage)
     }
+
+    @Test
+    fun outcomes_default_missing_values_to_safe_fallbacks() {
+        val syncSuccess = SessionOperationFlow.registrySyncOutcome(isSuccess = true, count = null)
+        val uploadSuccess = SessionOperationFlow.queueUploadOutcome(isSuccess = true, count = null, errorMessage = null)
+        val uploadFailure = SessionOperationFlow.queueUploadOutcome(isSuccess = false, count = null, errorMessage = null)
+
+        assertEquals(0, syncSuccess.formatArg)
+        assertEquals("0", uploadSuccess.formatArg)
+        assertEquals("", uploadFailure.formatArg)
+        assertTrue(uploadFailure.longMessage)
+    }
 }

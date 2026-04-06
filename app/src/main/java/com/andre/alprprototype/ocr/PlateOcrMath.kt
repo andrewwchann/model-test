@@ -90,15 +90,14 @@ internal object PlateOcrMath {
     fun buildVariants(bitmap: Bitmap): List<Bitmap> {
         val variants = mutableListOf<Bitmap>()
         variants += bitmap
-        focusedBandCrop(bitmap, 0.20f, 0.85f)?.let { variants += it }
+        variants += focusedBandCrop(bitmap, 0.20f, 0.85f)
         return variants.distinctBy { "${it.width}x${it.height}" }
     }
 
-    fun focusedBandCrop(source: Bitmap, topFraction: Float, bottomFraction: Float): Bitmap? {
+    fun focusedBandCrop(source: Bitmap, topFraction: Float, bottomFraction: Float): Bitmap {
         val top = (source.height * topFraction).toInt().coerceIn(0, source.height - 1)
         val bottom = (source.height * bottomFraction).toInt().coerceIn(top + 1, source.height)
-        if (bottom <= top) return null
-        return Bitmap.createBitmap(source, 0, top, source.width, bottom - top)
+        return Bitmap.createBitmap(source, 0, top, source.width, (bottom - top).coerceAtLeast(1))
     }
 }
 

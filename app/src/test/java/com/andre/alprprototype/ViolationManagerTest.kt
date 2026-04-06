@@ -1,6 +1,7 @@
 package com.andre.alprprototype
 
 import android.app.Application
+import com.google.gson.Gson
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.After
@@ -285,6 +286,15 @@ class ViolationManagerTest {
     }
 
     @Test
+    fun loadQueue_treats_json_null_as_empty_queue() {
+        queueFile.writeText("null")
+
+        val manager = ViolationManager(context)
+
+        assertEquals(0, manager.getQueueSize())
+    }
+
+    @Test
     fun loadQueue_keeps_empty_queue_when_file_does_not_exist() {
         queueFile.delete()
 
@@ -307,6 +317,24 @@ class ViolationManagerTest {
         assertTrue(saved)
         assertTrue(queueFile.exists())
         assertTrue(queueFile.readText().contains("ABC123"))
+    }
+
+    @Test
+    fun saveQueue_replaces_existing_queue_file() {
+        queueFile.parentFile?.mkdirs()
+        queueFile.writeText("old")
+        val manager = ViolationManager(context)
+        ReflectionHelpers.setField(
+            manager,
+            "queuedViolations",
+            mutableListOf(violation("plate.jpg", "vehicle.jpg")),
+        )
+
+        val saved = ReflectionHelpers.callInstanceMethod<Boolean>(manager, "saveQueue")
+
+        assertTrue(saved)
+        assertTrue(queueFile.readText().contains("ABC123"))
+        assertFalse(queueFile.readText().contains("old"))
     }
 
     @Test
@@ -423,6 +451,27 @@ class ViolationManagerTest {
     }
 
     @Test
+    fun deleteOriginalAssetIfStaged_ignores_blank_original_and_null_staged_paths() {
+        val manager = ViolationManager(context)
+        val original = File(context.cacheDir, "original-null-ignore.jpg").apply { writeText("x") }
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            manager,
+            "deleteOriginalAssetIfStaged",
+            ClassParameter.from(String::class.java, ""),
+            ClassParameter.from(String::class.java, "staged.jpg"),
+        )
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            manager,
+            "deleteOriginalAssetIfStaged",
+            ClassParameter.from(String::class.java, original.absolutePath),
+            ClassParameter.from(String::class.java, null),
+        )
+
+        assertTrue(original.exists())
+    }
+
+    @Test
     fun deleteFileQuietly_handles_blank_and_existing_paths() {
         val manager = ViolationManager(context)
         val file = File(context.cacheDir, "quiet-delete.jpg").apply { writeText("x") }
@@ -439,6 +488,54 @@ class ViolationManagerTest {
         )
 
         assertFalse(file.exists())
+    }
+
+    @Test
+    fun deleteFileQuietly_handles_null_path() {
+        val manager = ViolationManager(context)
+
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            manager,
+            "deleteFileQuietly",
+            ClassParameter.from(String::class.java, null),
+        )
+    }
+
+    @Test
+    fun uploadQueue_skips_already_uploaded_assets_and_removes_only_completed_entries() {
+        val uploadable = ViolationEvent(
+            rawOcrText = "ABC123",
+            confidenceScore = 0.9f,
+            timestamp = "2026-01-01T00:00:00Z",
+            operatorId = "Device_01",
+            localPlatePath = null,
+            localVehiclePath = null,
+            s3PlateUri = "s3://bucket/plate.jpg",
+            s3EvidenceUri = "s3://bucket/vehicle.jpg",
+        )
+        val pending = ViolationEvent(
+            rawOcrText = "ABC123",
+            confidenceScore = 0.9f,
+            timestamp = "2026-01-01T00:00:00Z",
+            operatorId = "Device_01",
+            localPlatePath = File(context.cacheDir, "pending-plate.jpg").absolutePath,
+            localVehiclePath = null,
+        )
+        File(pending.localPlatePath!!).apply { parentFile?.mkdirs(); writeText("plate") }
+
+        queueFile.writeText(Gson().toJson(listOf(uploadable, pending)))
+        val api = FakeViolationApi()
+        val manager = ViolationManager(context) { api }
+
+        val uploadResult = kotlinx.coroutines.runBlocking { manager.uploadQueue() }
+
+        assertTrue(uploadResult.isSuccess)
+        assertEquals(1, uploadResult.getOrNull())
+        assertEquals(1, manager.getQueueSize())
+        assertEquals(1, api.uploadUrlRequests.size)
+        assertEquals(1, api.uploadRequests.size)
+        assertEquals(1, api.batchUploads.size)
+        assertEquals("ABC123", api.batchUploads.single().single().rawOcrText)
     }
 
     @Test

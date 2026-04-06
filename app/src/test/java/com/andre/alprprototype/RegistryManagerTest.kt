@@ -78,6 +78,19 @@ class RegistryManagerTest {
     }
 
     @Test
+    fun isPlateValid_returnsValid_when_plate_has_no_expiry() {
+        cacheFile.writeText(
+            """
+            [{"plate_string":"ABC123","expiry_date":null}]
+            """.trimIndent(),
+        )
+
+        val manager = RegistryManager(context)
+
+        assertEquals(RegistryManager.PlateValidationResult.VALID, manager.isPlateValid(" abc123 "))
+    }
+
+    @Test
     fun constructor_tolerates_invalid_cache_json() {
         cacheFile.writeText("{not-json}")
 

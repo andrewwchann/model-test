@@ -56,9 +56,13 @@ class PlateOcrMathTest {
     fun extractPlateLogits_handles_supported_and_unsupported_shapes() {
         val direct = arrayOf(floatArrayOf(1f, 2f), floatArrayOf(3f, 4f))
         val nested = arrayOf(arrayOf(floatArrayOf(5f, 6f), floatArrayOf(7f, 8f)))
+        val emptyOuter = emptyArray<Array<FloatArray>>()
+        val nestedBad = arrayOf(arrayOf("bad"))
 
         assertEquals(2, PlateOcrMath.extractPlateLogits(direct)?.size)
         assertEquals(2, PlateOcrMath.extractPlateLogits(nested)?.size)
+        assertNull(PlateOcrMath.extractPlateLogits(emptyOuter))
+        assertNull(PlateOcrMath.extractPlateLogits(nestedBad))
         assertNull(PlateOcrMath.extractPlateLogits("bad"))
         assertNull(PlateOcrMath.extractPlateLogits(arrayOf("bad")))
     }
@@ -81,6 +85,24 @@ class PlateOcrMathTest {
         assertEquals('C', decoded.slots[1].character)
         assertEquals('_', decoded.slots[2].character)
         assertTrue(decoded.averageConfidence > 0f)
+    }
+
+    @Test
+    fun decodeFixedSlots_defaults_unknown_indices_and_empty_logits_to_safe_values() {
+        val unknown = PlateOcrMath.decodeFixedSlots(
+            logits = arrayOf(floatArrayOf(0.1f, 0.2f, 0.3f, 0.9f)),
+            config = config.copy(alphabet = "ABC", padChar = '_'),
+        )
+        val empty = PlateOcrMath.decodeFixedSlots(
+            logits = emptyArray(),
+            config = config,
+        )
+
+        assertEquals("_", unknown.rawText)
+        assertEquals("", unknown.finalText)
+        assertEquals('_', unknown.slots.single().character)
+        assertEquals(0f, empty.averageConfidence, 0.0001f)
+        assertTrue(empty.slots.isEmpty())
     }
 
     @Test
@@ -121,5 +143,15 @@ class PlateOcrMathTest {
         assertEquals(10, variants[0].height)
         assertEquals(20, variants[1].width)
         assertTrue(variants[1].height < variants[0].height)
+    }
+
+    @Test
+    fun buildVariants_returns_only_original_when_focused_crop_is_unavailable() {
+        val bitmap = Bitmap.createBitmap(20, 1, Bitmap.Config.ARGB_8888)
+
+        val variants = PlateOcrMath.buildVariants(bitmap)
+
+        assertEquals(1, variants.size)
+        assertEquals(bitmap, variants.single())
     }
 }

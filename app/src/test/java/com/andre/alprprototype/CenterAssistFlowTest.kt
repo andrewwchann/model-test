@@ -50,6 +50,17 @@ class CenterAssistFlowTest {
     }
 
     @Test
+    fun decideArm_ignores_when_violation_processing_is_active() {
+        val decision = CenterAssistFlow.decideArm(
+            canUpdateUi = true,
+            isProcessingViolation = true,
+            overlayRect = NormalizedRect(0f, 0f, 1f, 1f),
+        )
+
+        assertTrue(decision is CenterAssistArmDecision.Ignore)
+    }
+
+    @Test
     fun capture_returns_preview_not_ready_when_bitmap_missing() {
         val decision = CenterAssistFlow.capture(
             canUpdateUi = true,
@@ -74,6 +85,36 @@ class CenterAssistFlowTest {
 
         assertTrue(decision is CenterAssistCaptureDecision.CaptureFailed)
         assertTrue(bitmap.isRecycled)
+    }
+
+    @Test
+    fun capture_ignores_when_ui_cannot_update() {
+        val bitmap = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)
+
+        val decision = CenterAssistFlow.capture(
+            canUpdateUi = false,
+            isProcessingViolation = false,
+            previewBitmap = bitmap,
+            saveFromCenter = { error("should not run") },
+        )
+
+        assertTrue(decision is CenterAssistCaptureDecision.Ignore)
+        assertFalse(bitmap.isRecycled)
+    }
+
+    @Test
+    fun capture_ignores_when_violation_processing_is_active() {
+        val bitmap = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)
+
+        val decision = CenterAssistFlow.capture(
+            canUpdateUi = true,
+            isProcessingViolation = true,
+            previewBitmap = bitmap,
+            saveFromCenter = { error("should not run") },
+        )
+
+        assertTrue(decision is CenterAssistCaptureDecision.Ignore)
+        assertFalse(bitmap.isRecycled)
     }
 
     @Test
@@ -107,6 +148,27 @@ class CenterAssistFlowTest {
         )
 
         assertEquals(crop, (decision as CenterAssistCaptureDecision.Captured).crop)
+        assertTrue(bitmap.isRecycled)
+    }
+
+    @Test
+    fun capture_does_not_recycle_when_bitmap_was_already_recycled_by_saver() {
+        val bitmap = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)
+
+        val decision = CenterAssistFlow.capture(
+            canUpdateUi = true,
+            isProcessingViolation = false,
+            previewBitmap = bitmap,
+            saveFromCenter = {
+                bitmap.recycle()
+                AssistedCropResult(
+                    path = "crop.jpg",
+                    normalizedRect = NormalizedRect(0.1f, 0.2f, 0.7f, 0.5f),
+                )
+            },
+        )
+
+        assertTrue(decision is CenterAssistCaptureDecision.Captured)
         assertTrue(bitmap.isRecycled)
     }
 }
