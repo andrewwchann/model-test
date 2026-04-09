@@ -9,7 +9,15 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 
-class BestPlateCropSaver(context: Context) {
+interface FrameCropSaver {
+    fun saveIfBest(
+        image: ImageProxy,
+        state: PipelineDebugState,
+        uprightBitmapProvider: (() -> Bitmap?)? = null,
+    ): String?
+}
+
+class BestPlateCropSaver(context: Context) : FrameCropSaver {
     private val outputDir = File(context.filesDir, "alpr-crops").apply { mkdirs() }
     private var bestSavedScore = 0f
     private var savedCount = 0
@@ -18,7 +26,13 @@ class BestPlateCropSaver(context: Context) {
     fun saveIfBest(
         image: ImageProxy,
         state: PipelineDebugState,
-        uprightBitmapProvider: (() -> Bitmap?)? = null,
+    ): String? = saveIfBest(image, state, null)
+
+    override
+    fun saveIfBest(
+        image: ImageProxy,
+        state: PipelineDebugState,
+        uprightBitmapProvider: (() -> Bitmap?)?,
     ): String? {
         val track = state.activeTrack ?: return null
         val quality = state.quality ?: return null

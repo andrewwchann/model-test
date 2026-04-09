@@ -8,10 +8,10 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.util.Locale
 
-class AssistedPlateCropSaver(context: Context) {
+class AssistedPlateCropSaver(context: Context) : AssistedCropController {
     private val outputDir = File(context.filesDir, "alpr-crops")
 
-    fun previewCenterRect(imageWidth: Int, imageHeight: Int): NormalizedRect? {
+    override fun previewCenterRect(imageWidth: Int, imageHeight: Int): NormalizedRect? {
         if (imageWidth <= 0 || imageHeight <= 0) {
             return null
         }
@@ -29,7 +29,7 @@ class AssistedPlateCropSaver(context: Context) {
         )
     }
 
-    fun saveFromCenter(previewBitmap: Bitmap): AssistedCropResult? {
+    override fun saveFromCenter(previewBitmap: Bitmap): AssistedCropResult? {
         if (previewBitmap.width <= 0 || previewBitmap.height <= 0) {
             return null
         }

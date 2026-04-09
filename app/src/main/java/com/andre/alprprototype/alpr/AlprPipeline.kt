@@ -46,19 +46,33 @@ data class PipelineDebugState(
     val quality: PlateQuality?,
 )
 
+interface FramePipeline {
+    fun process(
+        frameNumber: Long,
+        image: ImageProxy,
+        uprightBitmapProvider: (() -> Bitmap?)? = null,
+    ): PipelineDebugState
+}
+
 class AlprPipeline(
     private val candidateGenerator: PlateCandidateGenerator,
     private val candidateFilter: PlateCandidateFilter = PlateLikeCandidateFilter(),
     private val tracker: PlateTracker = SimplePlateTracker(),
     private val qualityScorer: PlateQualityScorer = LivePlateQualityScorer(),
     private val scanEveryNFrames: Int = 4,
-) : AutoCloseable {
+) : AutoCloseable, FramePipeline {
     private var lastTrackId: Int? = null
 
     fun process(
         frameNumber: Long,
         image: ImageProxy,
-        uprightBitmapProvider: (() -> Bitmap?)? = null,
+    ): PipelineDebugState = process(frameNumber, image, null)
+
+    override
+    fun process(
+        frameNumber: Long,
+        image: ImageProxy,
+        uprightBitmapProvider: (() -> Bitmap?)?,
     ): PipelineDebugState {
         val (displayWidth, displayHeight) = uprightFrameSize(image)
         // Speed: Allow frequent scans if we don't have an active track

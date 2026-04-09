@@ -1,4 +1,6 @@
-package com.andre.alprprototype
+package com.andre.alprprototype.ocr
+
+import com.andre.alprprototype.OcrDisplayResult
 
 internal data class AssistedOcrPolicyConfig(
     val minTextLength: Int,

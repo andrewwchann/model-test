@@ -42,6 +42,7 @@
     <string name="registry_status_expired">Registry status: registration expired</string>
     <string name="registry_status_not_found">Registry status: plate not found in registry</string>
     <string name="plate_valid_message">Valid registration found: %1$s</string>
+    <string name="plate_corrected_valid_message">Plate corrected: valid registration found</string>
     <string name="evidence_dialog_title">Capture Vehicle Photo</string>
     <string name="evidence_dialog_message">Aim at the full vehicle, then capture when it is framed clearly.</string>
     <string name="evidence_dialog_cancel">Cancel</string>
@@ -49,4 +50,24 @@
     <string name="confirm_vehicle_photo_title">Confirm Vehicle Photo</string>
     <string name="confirm_vehicle_photo_retake">Retake</string>
     <string name="confirm_vehicle_photo_accept">Good</string>
+    <string name="pending_upload_before_closing_title">Queued uploads before closing</string>
+    <string name="pending_upload_saved_title">Queued uploads saved</string>
+    <string name="pending_upload_sync_now">Sync now</string>
+    <string name="pending_upload_wifi_settings">Wi-Fi settings</string>
+    <string name="pending_upload_end_session">End session</string>
+    <string name="pending_upload_later">Later</string>
+    <string name="pending_upload_synced_message">Uploaded %1$d queued item(s)</string>
+    <string name="pending_upload_not_synced">Queued uploads not synced</string>
+    <string name="sync_registry_button">Sync Registry</string>
+    <string name="sync_registry_loading">Syncing...</string>
+    <string name="registry_sync_success">Registry synced: %1$d plates</string>
+    <string name="registry_sync_failed">Sync failed</string>
+    <string name="upload_queue_button_format">Upload (%1$d)</string>
+    <string name="upload_queue_loading">Uploading...</string>
+    <string name="upload_queue_empty">Queue is empty</string>
+    <string name="upload_queue_success">Uploaded %1$s violations</string>
+    <string name="upload_queue_failed">Upload failed: %1$s</string>
+    <string name="camera_not_ready_message">Camera not ready</string>
+    <string name="violation_queued_message">Violation queued: %1$s</string>
+    <string name="violation_queue_failed_message">Failed to queue violation</string>
 </resources>

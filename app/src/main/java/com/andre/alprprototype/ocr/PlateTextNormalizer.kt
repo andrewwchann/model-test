@@ -1,4 +1,4 @@
-package com.andre.alprprototype
+package com.andre.alprprototype.ocr
 
 internal object PlateTextNormalizer {
     fun normalize(rawText: String): String {

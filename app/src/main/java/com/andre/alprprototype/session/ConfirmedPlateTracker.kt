@@ -1,4 +1,4 @@
-package com.andre.alprprototype
+package com.andre.alprprototype.session
 
 internal class ConfirmedPlateTracker(
     private val cooldownMs: Long,

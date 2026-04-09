@@ -4,11 +4,10 @@ import android.graphics.Bitmap
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.andre.alprprototype.alpr.AlprPipeline
-import com.andre.alprprototype.alpr.BestPlateCropSaver
+import com.andre.alprprototype.alpr.FrameCropSaver
+import com.andre.alprprototype.alpr.FramePipeline
 import com.andre.alprprototype.alpr.PipelineDebugState
 import com.andre.alprprototype.alpr.toUprightBitmap
-import kotlin.math.abs
 import java.util.concurrent.atomic.AtomicLong
 
 data class AnalyzedFrame(
@@ -17,37 +16,24 @@ data class AnalyzedFrame(
 )
 
 class PlateFrameAnalyzer(
-    private val pipeline: AlprPipeline,
-    private val cropSaver: BestPlateCropSaver,
+    private val pipeline: FramePipeline,
+    private val cropSaver: FrameCropSaver,
     private val shouldAnalyze: () -> Boolean = { true },
     private val onFrameAnalyzed: (AnalyzedFrame) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
     private val frameCounter = AtomicLong(0)
-    private var previousMotionSignature: IntArray? = null
-    private var stableFrameCount: Int = 0
-    private var motionPauseActive: Boolean = false
+    private val motionStabilityGate = MotionStabilityGate()
 
     override fun analyze(image: ImageProxy) {
         try {
             if (!shouldAnalyze()) {
-                resetMotionTracking()
+                motionStabilityGate.reset()
                 return
             }
             val motionSignature = buildMotionSignature(image)
-            if (motionSignature != null) {
-                val motionScore = previousMotionSignature?.let { computeMotionScore(it, motionSignature) } ?: 0f
-                previousMotionSignature = motionSignature
-                val stableNow = motionScore <= MOTION_STABLE_THRESHOLD
-                stableFrameCount = if (stableNow) stableFrameCount + 1 else 0
-                if (!stableNow && motionScore >= MOTION_PAUSE_THRESHOLD) {
-                    motionPauseActive = true
-                } else if (motionPauseActive && stableFrameCount >= STABLE_FRAMES_TO_RESUME) {
-                    motionPauseActive = false
-                }
-                if (motionPauseActive) {
-                    return
-                }
+            if (!motionStabilityGate.shouldProcess(motionSignature)) {
+                return
             }
             val currentFrame = frameCounter.incrementAndGet()
             var convertDurationMs: Long? = null
@@ -107,28 +93,8 @@ class PlateFrameAnalyzer(
         return signature
     }
 
-    private fun computeMotionScore(previous: IntArray, current: IntArray): Float {
-        if (previous.size != current.size || previous.isEmpty()) {
-            return Float.MAX_VALUE
-        }
-        var totalDelta = 0f
-        for (index in previous.indices) {
-            totalDelta += abs(previous[index] - current[index]).toFloat()
-        }
-        return totalDelta / previous.size
-    }
-
-    private fun resetMotionTracking() {
-        previousMotionSignature = null
-        stableFrameCount = 0
-        motionPauseActive = false
-    }
-
     companion object {
         private const val MOTION_GRID_ROWS = 6
         private const val MOTION_GRID_COLS = 6
-        private const val MOTION_STABLE_THRESHOLD = 9f
-        private const val MOTION_PAUSE_THRESHOLD = 18f
-        private const val STABLE_FRAMES_TO_RESUME = 4
     }
 }

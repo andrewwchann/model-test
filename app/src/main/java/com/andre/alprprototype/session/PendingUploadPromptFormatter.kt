@@ -1,4 +1,4 @@
-package com.andre.alprprototype
+package com.andre.alprprototype.session
 
 internal object PendingUploadPromptFormatter {
     fun buildMessage(pendingCount: Int, atSessionEnd: Boolean): String {
